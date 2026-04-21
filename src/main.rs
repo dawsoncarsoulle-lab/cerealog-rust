@@ -86,8 +86,9 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
         "SELECT status, parsed_date, error_message, message_guid
          FROM sap_monitoring_logs
          ORDER BY parsed_date DESC NULLS LAST
-         LIMIT 500",
+         LIMIT $1",
     )
+    .bind(app.logs_limit as i64)
     .fetch_all(pool)
     .await?;
 
@@ -156,6 +157,35 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
     app.last_refresh = Instant::now();
     app.apply_filters(); // Re-filtrer automatiquement après un refresh
 
+    // --- ANALYTICS ---
+    let activity: Vec<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM sap_monitoring_logs
+         WHERE parsed_date > NOW() - INTERVAL '12 hours'
+         GROUP BY date_trunc('hour', parsed_date)
+         ORDER BY date_trunc('hour', parsed_date)",
+    )
+    .fetch_all(pool)
+    .await?;
+    app.activity_sparkline = activity.iter().map(|(c,)| *c as u64).collect();
+
+    let top_errors: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT artifact_id, COUNT(*) as cnt
+         FROM artifact_errors
+         GROUP BY artifact_id
+         ORDER BY cnt DESC
+         LIMIT 5",
+    )
+    .fetch_all(pool)
+    .await?;
+    app.top_errors_barchart = top_errors.into_iter().map(|(id, c)| (id, c as u64)).collect();
+
+    let statuses: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM sap_monitoring_logs WHERE status IS NOT NULL GROUP BY status",
+    )
+    .fetch_all(pool)
+    .await?;
+    app.status_counts = statuses.into_iter().map(|(s, c)| (s, c as u64)).collect();
+
     Ok(())
 }
 
@@ -216,6 +246,8 @@ async fn main() -> anyhow::Result<()> {
     let mut app = App::new();
     refresh_views(&mut app, &pool).await?;
 
+    const AUTO_REFRESH: Duration = Duration::from_secs(300);
+
     // Boucle principale
     loop {
         ui::run_tui(&mut app)?;
@@ -227,9 +259,9 @@ async fn main() -> anyhow::Result<()> {
         if matches!(app.overlay, OverlayState::Running { .. }) {
             app.overlay = OverlayState::Hidden;
             app.should_quit = false;
-
+            let limit = app.logs_limit;
             let pb = create_spinner("Re-extraction SAP...");
-            match load_data(&mut app, &pool, top, false).await {
+            match load_data(&mut app, &pool, limit, false).await {
                 Ok(()) => {
                     pb.finish_with_message("Re-extraction terminée !");
                     app.overlay = OverlayState::Done {
@@ -242,6 +274,24 @@ async fn main() -> anyhow::Result<()> {
                         message: format!("{}", e),
                     };
                 }
+            }
+        }
+
+        if matches!(app.overlay, OverlayState::LoadMore) {
+            app.overlay = OverlayState::Hidden;
+            app.should_quit = false;
+            let limit = app.logs_limit;
+            let pb = create_spinner(&format!("Chargement de {} logs...", limit));
+            match load_data(&mut app, &pool, limit, false).await {
+                Ok(()) => pb.finish_with_message("Chargement terminé !"),
+                Err(e) => pb.finish_with_message(format!("Erreur: {}", e)),
+            }
+        }
+
+        if app.last_refresh.elapsed() >= AUTO_REFRESH {
+            match refresh_views(&mut app, &pool).await {
+                Ok(()) => {}
+                Err(_) => {}
             }
         }
     }

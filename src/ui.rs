@@ -10,7 +10,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Clear, Paragraph, Row,
+        Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row,
         Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table, TableState, Tabs, Wrap,
     },
     Frame, Terminal,
@@ -44,11 +44,12 @@ pub enum Tab {
     Artifacts,
     Packages,
     Errors,
+    Analytics,
 }
 
 impl Tab {
     fn all() -> &'static [Tab] {
-        &[Tab::Logs, Tab::Artifacts, Tab::Packages, Tab::Errors]
+        &[Tab::Logs, Tab::Artifacts, Tab::Packages, Tab::Errors, Tab::Analytics]
     }
     fn index(self) -> usize {
         Tab::all().iter().position(|&t| t == self).unwrap_or(0)
@@ -63,6 +64,8 @@ pub enum OverlayState {
     Running { message: String, spinner_tick: u8 },
     Done { message: String },
     Error { message: String },
+    ArtifactDetail { name: String, status: String, error: Option<String> },
+    LoadMore,
 }
 
 // ─── App State ───────────────────────────────────────────────────────────────
@@ -80,13 +83,22 @@ pub struct App {
     pub error_sparkline: Vec<u64>,
     pub error_barchart: Vec<(String, u64)>,
 
+    // Analytics
+    pub activity_sparkline: Vec<u64>,
+    pub top_errors_barchart: Vec<(String, u64)>,
+    pub status_counts: Vec<(String, u64)>,
+
     // Filtres et Recherche
     pub search_query: String,
     pub search_active: bool,
     pub filter_failed: bool,
     pub filtered_logs: Vec<LogView>,
+    pub filtered_artifacts: Vec<ArtifactView>,
+    pub filtered_packages: Vec<PackageView>,
+    pub filtered_errors: Vec<ErrorView>,
 
     pub stats: Stats,
+    pub logs_limit: u32,
     pub should_quit: bool,
     pub overlay: OverlayState,
     pub last_tick: Instant,
@@ -124,11 +136,18 @@ impl App {
             errors: vec![],
             error_sparkline: vec![],
             error_barchart: vec![],
+            activity_sparkline: vec![],
+            top_errors_barchart: vec![],
+            status_counts: vec![],
             search_query: String::new(),
             search_active: false,
             filter_failed: false,
             filtered_logs: vec![],
+            filtered_artifacts: vec![],
+            filtered_packages: vec![],
+            filtered_errors: vec![],
             stats: Stats::default(),
+            logs_limit: 200,
             should_quit: false,
             overlay: OverlayState::Hidden,
             last_tick: Instant::now(),
@@ -138,33 +157,36 @@ impl App {
 
     pub fn apply_filters(&mut self) {
         let q = self.search_query.to_lowercase();
-        self.filtered_logs = self
-            .logs
-            .iter()
-            .filter(|l| {
-                let failed_ok = !self.filter_failed || l.status.as_deref() == Some("FAILED");
-                let search_ok = q.is_empty()
-                    || l.status
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q)
-                    || l.error_message
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q)
-                    || l.message_guid
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q);
-                failed_ok && search_ok
-            })
-            .cloned()
-            .collect();
 
-        let len = self.filtered_logs.len();
+        self.filtered_logs = self.logs.iter().filter(|l| {
+            let failed_ok = !self.filter_failed || l.status.as_deref() == Some("FAILED");
+            let search_ok = q.is_empty()
+                || l.status.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || l.error_message.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || l.message_guid.as_deref().unwrap_or("").to_lowercase().contains(&q);
+            failed_ok && search_ok
+        }).cloned().collect();
+
+        self.filtered_artifacts = self.artifacts.iter().filter(|a| {
+            q.is_empty()
+                || a.name.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || a.status.as_deref().unwrap_or("").to_lowercase().contains(&q)
+        }).cloned().collect();
+
+        self.filtered_packages = self.packages.iter().filter(|p| {
+            q.is_empty()
+                || p.id.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || p.name.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                || p.vendor.as_deref().unwrap_or("").to_lowercase().contains(&q)
+        }).cloned().collect();
+
+        self.filtered_errors = self.errors.iter().filter(|e| {
+            q.is_empty()
+                || e.artifact_id.to_lowercase().contains(&q)
+                || e.error_message.as_deref().unwrap_or("").to_lowercase().contains(&q)
+        }).cloned().collect();
+
+        let len = self.current_len();
         if let Some(i) = self.table_state.selected() {
             if i >= len && len > 0 {
                 self.table_state.select(Some(len - 1));
@@ -176,10 +198,11 @@ impl App {
 
     pub fn current_len(&self) -> usize {
         match self.active_tab {
-            Tab::Logs => self.filtered_logs.len(), // Utilise la vue filtrée !
-            Tab::Artifacts => self.artifacts.len(),
-            Tab::Packages => self.packages.len(),
-            Tab::Errors => self.errors.len(),
+            Tab::Logs => self.filtered_logs.len(),
+            Tab::Artifacts => self.filtered_artifacts.len(),
+            Tab::Packages => self.filtered_packages.len(),
+            Tab::Errors => self.filtered_errors.len(),
+            Tab::Analytics => 0,
         }
     }
 
@@ -265,25 +288,26 @@ fn run_loop<B: ratatui::backend::Backend>(
                 }
 
                 match &app.overlay {
-                    OverlayState::Done { .. } | OverlayState::Error { .. } => {
+                    OverlayState::Done { .. } | OverlayState::Error { .. } | OverlayState::ArtifactDetail { .. } => {
                         if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                             app.overlay = OverlayState::Hidden;
                         }
                         continue;
                     }
-                    OverlayState::Running { .. } => return Ok(()),
+                    OverlayState::Running { .. } | OverlayState::LoadMore => return Ok(()),
                     OverlayState::Hidden => {}
                 }
 
                 // GESTION DU MODE RECHERCHE
                 if app.search_active {
                     match key.code {
-                        KeyCode::Esc | KeyCode::Enter => {
+                        KeyCode::Esc => {
                             app.search_active = false;
-                            if key.code == KeyCode::Esc {
-                                app.search_query.clear();
-                                app.apply_filters();
-                            }
+                            app.search_query.clear();
+                            app.apply_filters();
+                        }
+                        KeyCode::Enter => {
+                            app.search_active = false;
                         }
                         KeyCode::Backspace => {
                             app.search_query.pop();
@@ -301,8 +325,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                 // NAVIGATION NORMALE
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                    KeyCode::Char('/') => app.search_active = true,
-                    KeyCode::Char('f') => {
+                    KeyCode::Char('f') if app.active_tab == Tab::Logs => {
                         app.filter_failed = !app.filter_failed;
                         app.apply_filters();
                     }
@@ -313,14 +336,35 @@ fn run_loop<B: ratatui::backend::Backend>(
                     KeyCode::Down | KeyCode::Char('j') => app.next_row(),
                     KeyCode::Up | KeyCode::Char('k') => app.prev_row(),
                     KeyCode::Char('r') => {
-                        // On indique qu'on passe en mode "Running"
                         app.overlay = OverlayState::Running {
                             message: "Extraction en cours...".to_string(),
                             spinner_tick: 0,
                         };
-                        // On force la sortie de la boucle TUI immédiatement
-                        // SANS passer should_quit à true !
                         return Ok(());
+                    }
+                    KeyCode::Enter if app.active_tab == Tab::Artifacts => {
+                        if let Some(i) = app.table_state.selected() {
+                            if let Some(art) = app.filtered_artifacts.get(i) {
+                                let error = app.errors.iter()
+                                    .find(|e| Some(e.artifact_id.as_str()) == art.name.as_deref())
+                                    .and_then(|e| e.error_message.clone());
+                                app.overlay = OverlayState::ArtifactDetail {
+                                    name: art.name.clone().unwrap_or_default(),
+                                    status: art.status.clone().unwrap_or_default(),
+                                    error,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Char('+') => {
+                        app.logs_limit += 500;
+                        app.overlay = OverlayState::LoadMore;
+                        return Ok(());
+                    }
+                    KeyCode::Char(c) if app.active_tab != Tab::Analytics => {
+                        app.search_active = true;
+                        app.search_query.push(c);
+                        app.apply_filters();
                     }
                     _ => {}
                 }
@@ -370,9 +414,10 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn tab_label(tab: Tab, app: &App) -> Line<'static> {
     let (name, count, is_alert) = match tab {
         Tab::Logs => ("Logs", app.filtered_logs.len(), false),
-        Tab::Artifacts => ("Artifacts", app.artifacts.len(), false),
-        Tab::Packages => ("Packages", app.packages.len(), false),
-        Tab::Errors => ("Erreurs", app.errors.len(), !app.errors.is_empty()),
+        Tab::Artifacts => ("Artifacts", app.filtered_artifacts.len(), false),
+        Tab::Packages => ("Packages", app.filtered_packages.len(), false),
+        Tab::Errors => ("Erreurs", app.filtered_errors.len(), !app.filtered_errors.is_empty()),
+        Tab::Analytics => ("Analytics", 0, false),
     };
     let badge_color = if is_alert { C_RED } else { C_TEXT_FAINT };
     Line::from(vec![
@@ -406,8 +451,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(" · Monitor  ", Style::default().fg(C_TEXT_DIM)),
         Span::styled(
-            format!("↻ {}", freshness),
+            format!("↻ {}  ", freshness),
             Style::default().fg(freshness_color),
+        ),
+        Span::styled(
+            format!("[{}] logs  +500", app.logs_limit),
+            Style::default().fg(C_TEXT_FAINT),
         ),
     ]))
     .block(
@@ -580,6 +629,7 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         Tab::Artifacts => draw_artifacts_table(f, app, area),
         Tab::Packages => draw_packages_table(f, app, area),
         Tab::Errors => draw_errors_table(f, app, area),
+        Tab::Analytics => draw_analytics(f, app, area),
     }
 }
 
@@ -784,7 +834,7 @@ fn draw_logs_table(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_artifacts_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = header_row(&["  Statut", "Nom de l'artifact"]);
     let rows: Vec<Row> = app
-        .artifacts
+        .filtered_artifacts
         .iter()
         .map(|art| {
             let status = art.status.as_deref().unwrap_or("—");
@@ -800,7 +850,7 @@ fn draw_artifacts_table(f: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, [Constraint::Length(22), Constraint::Min(0)])
         .header(header)
-        .block(table_block("Runtime Artifacts", app.artifacts.len()))
+        .block(table_block("Runtime Artifacts", app.filtered_artifacts.len()))
         .highlight_style(Style::default().bg(C_SEL_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -809,7 +859,7 @@ fn draw_artifacts_table(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_packages_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = header_row(&["ID", "Nom", "Version", "Vendor"]);
     let rows: Vec<Row> = app
-        .packages
+        .filtered_packages
         .iter()
         .map(|pkg| {
             Row::new(vec![
@@ -834,7 +884,7 @@ fn draw_packages_table(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(table_block("Integration Packages", app.packages.len()))
+        .block(table_block("Integration Packages", app.filtered_packages.len()))
         .highlight_style(Style::default().bg(C_SEL_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -843,7 +893,7 @@ fn draw_packages_table(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_errors_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = header_row(&["Artifact ID", "Date", "Message d'erreur"]);
     let rows: Vec<Row> = app
-        .errors
+        .filtered_errors
         .iter()
         .map(|err| {
             let date_str = err
@@ -866,7 +916,7 @@ fn draw_errors_table(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    if app.errors.is_empty() {
+    if app.filtered_errors.is_empty() {
         let para = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -886,10 +936,121 @@ fn draw_errors_table(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(table_block("Erreurs de déploiement", app.errors.len()))
+        .block(table_block("Erreurs de déploiement", app.filtered_errors.len()))
         .highlight_style(Style::default().bg(C_SEL_BG).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(table, area, &mut app.table_state);
+}
+
+// ─── Analytics Dashboard ─────────────────────────────────────────────────────
+
+fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(rows[0]);
+
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    // ── Gauge taux de succès ──
+    let total = app.stats.total_logs.max(1) as f64;
+    let completed = (app.stats.total_logs - app.stats.failed_logs).max(0) as f64;
+    let ratio = (completed / total).clamp(0.0, 1.0);
+    let pct = (ratio * 100.0) as u16;
+    let gauge_color = if pct >= 90 { C_GREEN } else if pct >= 70 { C_AMBER } else { C_RED };
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .title(" Taux de Succes ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(C_BORDER_ACTIVE))
+                .style(Style::default().bg(C_SURFACE)),
+        )
+        .gauge_style(Style::default().fg(gauge_color).bg(C_SURFACE2))
+        .ratio(ratio)
+        .label(format!("{}%  ({} / {})", pct, completed as i64, app.stats.total_logs));
+    f.render_widget(gauge, top[0]);
+
+    // ── Top 5 artifacts en erreur ──
+    let bars: Vec<Bar> = app
+        .top_errors_barchart
+        .iter()
+        .map(|(label, val)| {
+            Bar::default()
+                .value(*val)
+                .label(label.chars().take(12).collect::<String>().into())
+                .style(Style::default().fg(C_RED))
+        })
+        .collect();
+    let bc = BarChart::default()
+        .block(
+            Block::default()
+                .title(" Top 5 Artifacts en Erreur ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(C_BORDER))
+                .style(Style::default().bg(C_SURFACE)),
+        )
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(6)
+        .bar_gap(1)
+        .value_style(Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD));
+    f.render_widget(bc, top[1]);
+
+    // ── Sparkline volume global (12h) ──
+    let spark = Sparkline::default()
+        .block(
+            Block::default()
+                .title(" Volume d'activite global / heure (12h) ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(C_BORDER))
+                .style(Style::default().bg(C_SURFACE)),
+        )
+        .data(&app.activity_sparkline)
+        .style(Style::default().fg(C_BLUE));
+    f.render_widget(spark, bottom[0]);
+
+    // ── Répartition des statuts ──
+    let status_icons = [
+        ("COMPLETED", "●", C_GREEN),
+        ("FAILED", "●", C_RED),
+        ("PROCESSING", "◌", C_AMBER),
+        ("STARTED", "●", C_BLUE),
+    ];
+    let mut lines = vec![Line::from(""), Line::from(Span::styled(" Repartition des statuts", Style::default().fg(C_TEXT_DIM).add_modifier(Modifier::BOLD))), Line::from("")];
+    for (status, icon, color) in status_icons {
+        let count = app
+            .status_counts
+            .iter()
+            .find(|(s, _)| s == status)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+            Span::styled(format!("{:<12}", status), Style::default().fg(C_TEXT)),
+            Span::styled(format!("{}", count), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(""));
+    }
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Statuts ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_SURFACE)),
+    );
+    f.render_widget(para, bottom[1]);
 }
 
 // ─── Footer ──────────────────────────────────────────────────────────────────
@@ -917,8 +1078,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let shortcuts = vec![
             ("↑↓ / j k", "naviguer"),
             ("Tab", "onglets"),
-            ("/", "rechercher"),
+            ("type", "rechercher"),
+            ("Esc", "effacer filtre"),
             ("f", "filtre erreurs"),
+            ("+", "500 logs de plus"),
             ("r", "re-extraire"),
             ("q / Esc", "quitter"),
         ];
@@ -987,7 +1150,48 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
             C_RED,
             " Appuyez sur Entrée ",
         ),
-        OverlayState::Hidden => return,
+        OverlayState::ArtifactDetail { name, status, error } => {
+            let popup_area = ratatui::layout::Rect {
+                x: area.x + area.width.saturating_sub(70) / 2,
+                y: area.y + area.height.saturating_sub(12) / 2,
+                width: 70.min(area.width),
+                height: 12.min(area.height),
+            };
+            f.render_widget(Clear, popup_area);
+            let color = match status.as_str() {
+                "STARTED" => C_GREEN,
+                "ERROR" => C_RED,
+                _ => C_AMBER,
+            };
+            let err_text = error.as_deref().unwrap_or("Aucune erreur enregistrée.");
+            let body = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" Statut  : ", Style::default().fg(C_TEXT_DIM)),
+                    Span::styled(status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(" Erreur  :", Style::default().fg(C_TEXT_DIM))),
+                Line::from(Span::styled(format!(" {}", err_text), Style::default().fg(C_RED))),
+                Line::from(""),
+                Line::from(Span::styled(" Esc / Entrée pour fermer", Style::default().fg(C_TEXT_FAINT))),
+            ])
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!(" {} ", name),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(color))
+                    .style(Style::default().bg(C_SURFACE2)),
+            )
+            .wrap(Wrap { trim: false });
+            f.render_widget(body, popup_area);
+            return;
+        }
+        OverlayState::Hidden | OverlayState::LoadMore => return,
     };
 
     let popup = Paragraph::new(vec![

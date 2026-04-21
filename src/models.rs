@@ -12,6 +12,7 @@ pub struct LogEntry {
     pub message_guid: Option<String>,
     pub status: Option<String>,
     pub log_start: Option<String>,
+    pub integration_flow_name: Option<String>,
 
     #[serde(skip)]
     pub parsed_date: Option<NaiveDateTime>,

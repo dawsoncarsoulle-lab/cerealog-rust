@@ -83,6 +83,13 @@ pub async fn fetch_sap_logs(
         let mut logs = odata.d.results;
         for log in &mut logs {
             log.parsed_date = clean_sap_date(log.log_start.as_deref());
+            if log.status.as_deref() == Some("FAILED") {
+                if let Some(artifact_id) = &log.integration_flow_name.clone() {
+                    if let Ok(Some(err)) = fetch_artifact_error(client, token, artifact_id).await {
+                        log.error_message = Some(err);
+                    }
+                }
+            }
         }
         Ok(logs)
     } else {
