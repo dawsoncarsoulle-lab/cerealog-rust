@@ -85,6 +85,9 @@ Crée un fichier `.env` à la racine du projet :
 DATABASE_URL=postgres://user:password@localhost/sap_monitoring
 CLIENT_ID=votre_client_id
 CLIENT_SECRET=votre_client_secret
+SAP_BASE_URL='https://xxx.it-cpi001.cfapps.eu10.hana.ondemand.com'
+SAP_TOKEN_URL='https://xxx.authentication.eu10.hana.ondemand.com/oauth/token?grant_type=client_credentials&token_format=jwt'
+
 ```
 
 ### Initialisation de la Base de Données
