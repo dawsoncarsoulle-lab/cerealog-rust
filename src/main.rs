@@ -43,30 +43,33 @@ async fn load_data(app: &mut App, pool: &sqlx::PgPool, top: u32) -> anyhow::Resu
     r2?;
     r3?;
 
-    let error_futs: Vec<_> = artifacts
-        .iter()
-        .filter(|a| a.status.as_deref() == Some("ERROR"))
-        .filter_map(|a| a.id.clone())
-        .map(|id| {
-            let client = client.clone();
-            let token = token.clone();
-            let pool = pool.clone();
-            async move {
-                if let Ok(Some(err_txt)) = api::fetch_artifact_error(&client, &token, &id).await {
-                    let _ = db::insert_artifact_error(
-                        &pool,
-                        models::ArtifactError {
-                            artifact_id: id,
-                            error_message: err_txt,
-                            error_time: chrono::Utc::now().naive_utc(),
-                        },
-                    )
-                    .await;
+    let error_stream = stream::iter(
+        artifacts
+            .iter()
+            .filter(|a| a.status.as_deref() == Some("ERROR"))
+            .filter_map(|a| a.id.clone())
+            .map(|id| {
+                let client = client.clone();
+                let token = token.clone();
+                let pool = pool.clone();
+                async move {
+                    if let Ok(Some(err_txt)) = api::fetch_artifact_error(&client, &token, &id).await
+                    {
+                        let _ = db::insert_artifact_error(
+                            &pool,
+                            models::ArtifactError {
+                                artifact_id: id,
+                                error_message: err_txt,
+                                error_time: chrono::Utc::now().naive_utc(),
+                            },
+                        )
+                        .await;
+                    }
                 }
-            }
-        })
-        .collect();
-    futures::future::join_all(error_futs).await;
+            }),
+    );
+
+    error_stream.buffer_unordered(50).collect::<Vec<_>>().await;
 
     let pkg_ids: Vec<String> = packages.iter().filter_map(|p| p.id.clone()).collect();
 
@@ -91,11 +94,8 @@ async fn load_data(app: &mut App, pool: &sqlx::PgPool, top: u32) -> anyhow::Resu
             }
         }
     });
-
-    config_stream.buffer_unordered(10).collect::<Vec<_>>().await;
-
+    config_stream.buffer_unordered(50).collect::<Vec<_>>().await;
     queries::refresh_all(app, pool).await?;
-
     Ok(())
 }
 
@@ -106,7 +106,6 @@ async fn main() -> anyhow::Result<()> {
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
 
-    // Pool PostgreSQL avec paramètres adaptés à la charge
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&db_url)
@@ -131,7 +130,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(()) => pb.finish_with_message("Données chargées !"),
             Err(e) => {
                 pb.finish_with_message(format!("Erreur chargement : {}", e));
-                // On tente quand même de charger ce qui est en base
                 let _ = queries::refresh_all(&mut app, &pool).await;
             }
         }
@@ -175,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
             }
 
             AppEvent::Continue => {
-                // Auto-refresh si le délai est dépassé
                 if app.last_refresh.elapsed() >= AUTO_REFRESH {
                     let limit = app.logs_limit;
                     let _ = load_data(&mut app, &pool, limit).await;

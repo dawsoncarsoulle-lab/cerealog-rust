@@ -12,9 +12,12 @@ use crate::models::{
 };
 
 const TOKEN_URL: &str = "https://crldevintegration.authentication.eu10.hana.ondemand.com/oauth/token?grant_type=client_credentials&token_format=jwt";
+
 const PACKAGES_URL: &str =
     "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationPackages";
-const ARTIFACTS_URL: &str = "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationRuntimeArtifacts";
+
+const ARTIFACTS_URL: &str =
+    "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationRuntimeArtifacts";
 
 fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
     let date_str = raw_date?;
@@ -37,11 +40,10 @@ fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
 }
 
 /// Construit un client HTTP réutilisable avec connection pooling activé.
-/// À appeler une seule fois et à passer en référence partout.
 pub fn build_http_client() -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(10)
-        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(50)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()?;
     Ok(client)
 }
@@ -73,6 +75,8 @@ pub async fn fetch_sap_logs(
     top: u32,
     filter: Option<&str>,
 ) -> Result<Vec<LogEntry>> {
+    use futures::stream::{self, StreamExt};
+
     let mut url = format!(
         "{}&$top={}",
         "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs?$orderby=LogStart desc",
@@ -94,21 +98,22 @@ pub async fn fetch_sap_logs(
         let odata: ODataResponse = res.json().await?;
         let mut logs = odata.d.results;
 
-        let error_futs: Vec<_> = logs
-            .iter()
-            .filter(|l| l.status.as_deref() == Some("FAILED"))
-            .filter_map(|l| l.message_guid.clone())
-            .map(|guid| {
-                let client = client.clone();
-                let token = token.to_string();
-                async move {
-                    let err = fetch_log_error(&client, &token, &guid).await;
-                    (guid, err)
-                }
-            })
-            .collect();
+        let error_stream = stream::iter(
+            logs.iter()
+                .filter(|l| l.status.as_deref() == Some("FAILED"))
+                .filter_map(|l| l.message_guid.clone())
+                .map(|guid| {
+                    let client = client.clone();
+                    let token = token.to_string();
+                    async move {
+                        let err = fetch_log_error(&client, &token, &guid).await;
+                        (guid, err)
+                    }
+                }),
+        );
 
-        let error_results = futures::future::join_all(error_futs).await;
+        let error_results: Vec<_> = error_stream.buffer_unordered(50).collect().await;
+
         let error_map: std::collections::HashMap<String, String> = error_results
             .into_iter()
             .filter_map(|(guid, res)| res.ok().flatten().map(|e| (guid, e)))
@@ -243,14 +248,14 @@ pub async fn fetch_artifacts_for_package(
     }
 }
 
-/// Récupère en parallèle les designtime artifacts de tous les packages.
-/// Retourne une map package_id -> Vec<art_id>
 pub async fn fetch_all_package_artifacts(
     client: &reqwest::Client,
     token: &str,
     package_ids: &[String],
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let futs = package_ids.iter().map(|pkg_id| {
+    use futures::stream::{self, StreamExt};
+
+    let stream = stream::iter(package_ids.iter().map(|pkg_id| {
         let client = client.clone();
         let token = token.to_string();
         let pkg_id = pkg_id.clone();
@@ -261,9 +266,14 @@ pub async fn fetch_all_package_artifacts(
             let ids: Vec<String> = arts.into_iter().filter_map(|a| a.id).collect();
             (pkg_id, ids)
         }
-    });
+    }));
 
-    futures::future::join_all(futs).await.into_iter().collect()
+    stream
+        .buffer_unordered(50)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect()
 }
 
 use crate::models::{ArtifactConfiguration, ODataConfigResponse};

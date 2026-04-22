@@ -15,7 +15,6 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -134,18 +133,12 @@ pub struct App {
     pub artifacts: Vec<ArtifactView>,
     pub packages: Vec<PackageView>,
     pub errors: Vec<ErrorView>,
-    pub configs: std::collections::HashMap<String, Vec<(String, String)>>, // 🟢 NOUVEAU
-
-    // Graphiques
+    pub configs: std::collections::HashMap<String, Vec<(String, String)>>,
     pub error_sparkline: Vec<u64>,
     pub error_barchart: Vec<(String, u64)>,
-
-    // Analytics
     pub activity_sparkline: Vec<u64>,
     pub top_errors_barchart: Vec<(String, u64)>,
     pub status_counts: Vec<(String, u64)>,
-
-    // Filtres et recherche
     pub search_query: String,
     pub search_active: bool,
     pub filter_failed: bool,
@@ -153,7 +146,6 @@ pub struct App {
     pub filtered_artifacts: Vec<ArtifactView>,
     pub filtered_packages: Vec<PackageView>,
     pub filtered_errors: Vec<ErrorView>,
-
     pub stats: Stats,
     pub logs_limit: u32,
     pub overlay: OverlayState,
@@ -214,8 +206,6 @@ impl App {
         }
     }
 
-    // ─── Accès au TableState de l'onglet actif
-
     fn tab_index(tab: Tab) -> usize {
         match tab {
             Tab::Logs => 0,
@@ -231,7 +221,7 @@ impl App {
         &mut self.table_states[i]
     }
 
-    /// Retourne la sélection de l'onglet actif (lecture seule).
+    /// Retourne la sélection de l'onglet actif
     pub fn selected(&self) -> Option<usize> {
         let i = Self::tab_index(self.active_tab);
         self.table_states[i].selected()
@@ -326,7 +316,6 @@ impl App {
             .cloned()
             .collect();
 
-        // Ajuste la sélection si elle déborde
         let len = self.current_len();
         if let Some(i) = self.selected() {
             if len == 0 {
@@ -422,7 +411,6 @@ fn run_loop<B: ratatui::backend::Backend>(
 
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-                // Ctrl+C global
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     return Ok(AppEvent::Quit);
                 }
@@ -504,7 +492,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     name: art.name.clone().unwrap_or_default(),
                                     status: art.status.clone().unwrap_or_default(),
                                     error,
-                                    configs: art_configs, // 🟢 On les envoie au popup
+                                    configs: art_configs,
                                 };
                             }
                         }
@@ -560,7 +548,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
 // ─── Header / Tabs ───────────────────────────────────────────────────────────
 
-/// Badge "[filtré/total]" — montre le filtrage en cours.
+/// Badge "[filtré/total]" — montre le filtrage en cours
 fn tab_label(tab: Tab, app: &App) -> Line<'static> {
     let (name, counts, is_alert) = match tab {
         Tab::Logs => (
@@ -986,7 +974,6 @@ fn draw_logs_table(f: &mut Frame, app: &mut App, area: Rect) {
         "Aperçu erreur",
     ]);
 
-    // 🟢 On récupère la recherche
     let query = &app.search_query;
 
     let rows: Vec<Row> = app
@@ -1272,10 +1259,7 @@ fn draw_packages_master_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_packages_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = header_row(&["ID", "Nom", "Version", "Tags", "Vendor"]);
-
-    // On récupère la recherche actuelle
     let query = &app.search_query;
-
     let rows: Vec<Row> = app
         .filtered_packages
         .iter()
@@ -1588,7 +1572,6 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
         configs,
     } = &app.overlay
     {
-        // 🟢 On calcule une hauteur dynamique pour le popup en fonction du nombre de propriétés !
         let popup_height = 14 + configs.len() as u16;
 
         let popup_area = Rect {
@@ -1609,7 +1592,6 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
             .as_deref()
             .unwrap_or("Aucune erreur d'initialisation enregistrée.");
 
-        // 🟢 Construction du texte du popup
         let mut lines = vec![
             Line::from(""),
             Line::from(vec![
@@ -1632,7 +1614,6 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(C_TEXT_FAINT),
             )));
         } else {
-            // On affiche chaque propriété avec sa clé et sa valeur
             for (key, val) in configs {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -1677,7 +1658,6 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Popup générique (Running / Done / Error)
     let popup_area = Rect {
         x: area.x + area.width.saturating_sub(52) / 2,
         y: area.y + area.height.saturating_sub(7) / 2,

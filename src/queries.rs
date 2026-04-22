@@ -1,12 +1,9 @@
-/// Ce module centralise toutes les requêtes de lecture vers la base de données.
-/// Les fonctions d'écriture restent dans db.rs.
 use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
 use crate::ui::{App, Stats};
 use anyhow::Result;
 use std::collections::HashMap;
 
 /// Rafraîchit toutes les données de l'App depuis la BDD.
-/// Les requêtes indépendantes sont exécutées en parallèle via tokio::join!
 pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
     let (logs_res, artifacts_res, packages_res, errors_res, configs_res) = tokio::join!(
         fetch_logs(pool, app.logs_limit),
@@ -21,8 +18,6 @@ pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
     app.packages = packages_res?;
     app.errors = errors_res?;
     app.configs = configs_res?;
-
-    // ... (le reste de refresh_all ne change pas)
 
     // ── Groupe 2 : stats & graphiques (parallèle) ────────────────────────────
     let (stats_res, hourly_res, daily_res, activity_res, top_errors_res, log_st_res, art_st_res) = tokio::join!(
@@ -41,7 +36,6 @@ pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
     app.activity_sparkline = activity_res?;
     app.top_errors_barchart = top_errors_res?;
 
-    // Fusion des statuts logs + artifacts
     let mut all_statuses: HashMap<String, u64> = HashMap::new();
     for (s, c) in log_st_res? {
         *all_statuses.entry(s).or_insert(0) += c as u64;
@@ -106,7 +100,6 @@ async fn fetch_errors(pool: &sqlx::PgPool) -> Result<Vec<ErrorView>> {
 }
 
 async fn fetch_stats(pool: &sqlx::PgPool) -> Result<Stats> {
-    // Une seule requête agrégée au lieu de 4 COUNT(*) séparés
     let row: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM sap_monitoring_logs),

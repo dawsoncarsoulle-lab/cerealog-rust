@@ -39,7 +39,6 @@ pub async fn insert_packages(pool: &sqlx::PgPool, packages: Vec<IntegrationPacka
         return Ok(());
     }
 
-    // Ligne 45 environ, ajoute tags dans la liste des colonnes :
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "INSERT INTO integration_packages (id, name, version, vendor, creation_date, tags) ",
     );
@@ -93,7 +92,7 @@ pub async fn insert_packages(pool: &sqlx::PgPool, packages: Vec<IntegrationPacka
              version = EXCLUDED.version, \
              vendor = EXCLUDED.vendor, \
              creation_date = EXCLUDED.creation_date, \
-             tags = EXCLUDED.tags", // 🟢 NOUVEAU
+             tags = EXCLUDED.tags",
     );
 
     qb.build().execute(pool).await?;
@@ -147,10 +146,9 @@ pub async fn insert_artifact_error(pool: &sqlx::PgPool, error: ArtifactError) ->
 }
 
 /// Met à jour le package_id de plusieurs artifacts en une seule transaction.
-/// Plus efficace que des UPDATE individuels.
 pub async fn bulk_update_artifact_package(
     pool: &sqlx::PgPool,
-    mappings: &[(String, String)], // (pkg_id, art_id)
+    mappings: &[(String, String)],
 ) -> Result<()> {
     if mappings.is_empty() {
         return Ok(());
@@ -204,8 +202,6 @@ pub struct LogView {
     pub message_guid: Option<String>,
     pub integration_flow_name: Option<String>,
 }
-
-// ... (reste du fichier)
 
 pub async fn insert_configurations(
     pool: &sqlx::PgPool,
