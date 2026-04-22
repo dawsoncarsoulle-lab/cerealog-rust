@@ -29,7 +29,6 @@ fn create_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-/// Charge toutes les données depuis SAP + BDD et remplit l'App
 async fn load_data(
     app: &mut App,
     pool: &sqlx::PgPool,
@@ -59,7 +58,6 @@ async fn load_data(
     db::insert_packages(pool, packages).await?;
     db::insert_artifacts(pool, artifacts.clone()).await?;
 
-    // Récupération erreurs artifacts
     for art in artifacts {
         if art.status.as_deref() == Some("ERROR") {
             if let Some(id) = art.id {
@@ -75,12 +73,10 @@ async fn load_data(
         }
     }
 
-    // Recharger les vues depuis la BDD
     refresh_views(app, pool).await?;
     Ok(())
 }
 
-/// Recharge les données locales depuis PostgreSQL (pas d'appel SAP)
 async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()> {
     app.logs = sqlx::query_as(
         "SELECT status, parsed_date, error_message, message_guid
@@ -92,10 +88,12 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
     .fetch_all(pool)
     .await?;
 
-    app.artifacts =
-        sqlx::query_as("SELECT name, status, deployed_on FROM runtime_artifacts ORDER BY name ASC")
-            .fetch_all(pool)
-            .await?;
+    // NOUVEAU : On récupère l'ID ici !
+    app.artifacts = sqlx::query_as(
+        "SELECT id, name, status, deployed_on FROM runtime_artifacts ORDER BY name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
 
     app.packages =
         sqlx::query_as("SELECT id, name, version, vendor, creation_date FROM integration_packages ORDER BY name ASC")
@@ -108,7 +106,6 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
     .fetch_all(pool)
     .await?;
 
-    // Stats
     let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sap_monitoring_logs")
         .fetch_one(pool)
         .await?;
@@ -128,7 +125,6 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
     app.stats.total_packages = pkgs.0;
     app.stats.total_artifacts = arts.0;
 
-    // --- GRAPHIQUES (Sparkline 24h & BarChart 7j) ---
     let hourly: Vec<(i64,)> = sqlx::query_as(
         "SELECT COUNT(*) FROM sap_monitoring_logs
          WHERE status = 'FAILED'
@@ -153,11 +149,9 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
         .map(|(d, c)| (d.format("%a").to_string(), *c as u64))
         .collect();
 
-    // Mise à jour de la date de fraîcheur
     app.last_refresh = Instant::now();
-    app.apply_filters(); // Re-filtrer automatiquement après un refresh
+    app.apply_filters();
 
-    // --- ANALYTICS ---
     let activity: Vec<(i64,)> = sqlx::query_as(
         "SELECT COUNT(*) FROM sap_monitoring_logs
          WHERE parsed_date > NOW() - INTERVAL '12 hours'
@@ -177,14 +171,33 @@ async fn refresh_views(app: &mut App, pool: &sqlx::PgPool) -> anyhow::Result<()>
     )
     .fetch_all(pool)
     .await?;
-    app.top_errors_barchart = top_errors.into_iter().map(|(id, c)| (id, c as u64)).collect();
+    app.top_errors_barchart = top_errors
+        .into_iter()
+        .map(|(id, c)| (id, c as u64))
+        .collect();
 
-    let statuses: Vec<(String, i64)> = sqlx::query_as(
+    // NOUVEAU : On additionne les statuts des Logs ET des Artifacts !
+    let mut all_statuses = std::collections::HashMap::new();
+
+    let log_statuses: Vec<(String, i64)> = sqlx::query_as(
         "SELECT status, COUNT(*) FROM sap_monitoring_logs WHERE status IS NOT NULL GROUP BY status",
     )
     .fetch_all(pool)
     .await?;
-    app.status_counts = statuses.into_iter().map(|(s, c)| (s, c as u64)).collect();
+    for (s, c) in log_statuses {
+        *all_statuses.entry(s).or_insert(0) += c as u64;
+    }
+
+    let art_statuses: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM runtime_artifacts WHERE status IS NOT NULL GROUP BY status",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (s, c) in art_statuses {
+        *all_statuses.entry(s).or_insert(0) += c as u64;
+    }
+
+    app.status_counts = all_statuses.into_iter().collect();
 
     Ok(())
 }
@@ -197,7 +210,6 @@ async fn main() -> anyhow::Result<()> {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
     let pool = sqlx::PgPool::connect(&db_url).await?;
 
-    // Mode health-check
     if cli.health {
         let pb = create_spinner("Vérification des connexions...");
         let _ = api::get_sap_token(&reqwest::Client::new()).await?;
@@ -248,7 +260,6 @@ async fn main() -> anyhow::Result<()> {
 
     const AUTO_REFRESH: Duration = Duration::from_secs(300);
 
-    // Boucle principale
     loop {
         ui::run_tui(&mut app)?;
 

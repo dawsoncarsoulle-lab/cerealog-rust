@@ -11,7 +11,6 @@ pub async fn insert_logs(pool: &sqlx::PgPool, logs: Vec<LogEntry>) -> Result<()>
         "INSERT INTO sap_monitoring_logs (message_guid, status, parsed_date, error_message) ",
     );
 
-    // Attention : on a retiré log_start ici pour coller à la base de données !
     query_builder.push_values(logs, |mut b, log| {
         b.push_bind(log.message_guid)
             .push_bind(log.status)
@@ -56,7 +55,6 @@ pub async fn insert_artifacts(pool: &sqlx::PgPool, artifacts: Vec<RuntimeArtifac
         return Ok(());
     }
 
-    // On s'aligne exactement sur les 4 colonnes du script SQL
     let mut query_builder: QueryBuilder<Postgres> =
         QueryBuilder::new("INSERT INTO runtime_artifacts (id, name, status, deployed_on) ");
 
@@ -124,6 +122,7 @@ pub async fn get_db_summary(pool: &sqlx::PgPool) -> Result<()> {
 
 #[derive(sqlx::FromRow, Clone)]
 pub struct ArtifactView {
+    pub id: Option<String>, // <--- NOUVEAU : On récupère l'ID pour faire le lien avec l'erreur !
     pub name: Option<String>,
     pub status: Option<String>,
     pub deployed_on: Option<chrono::NaiveDateTime>,
@@ -153,13 +152,14 @@ pub struct LogView {
     pub message_guid: Option<String>,
 }
 
-// ─── ANCIENNES FONCTIONS D'AFFICHAGE CLI (Toujours utilisables) ─────
+// ─── ANCIENNES FONCTIONS D'AFFICHAGE CLI ─────────────────────────────
 
 pub async fn get_view_of_runtime(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    let runtime_view: Vec<ArtifactView> =
-        sqlx::query_as("SELECT name, status, deployed_on FROM runtime_artifacts ORDER BY name ASC")
-            .fetch_all(pool)
-            .await?;
+    let runtime_view: Vec<ArtifactView> = sqlx::query_as(
+        "SELECT id, name, status, deployed_on FROM runtime_artifacts ORDER BY name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
 
     println!("\n=== LISTE DES ARTEFACTS DÉPLOYÉS ===");
     for art in runtime_view {

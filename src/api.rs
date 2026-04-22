@@ -84,8 +84,8 @@ pub async fn fetch_sap_logs(
         for log in &mut logs {
             log.parsed_date = clean_sap_date(log.log_start.as_deref());
             if log.status.as_deref() == Some("FAILED") {
-                if let Some(artifact_id) = &log.integration_flow_name.clone() {
-                    if let Ok(Some(err)) = fetch_artifact_error(client, token, artifact_id).await {
+                if let Some(guid) = &log.message_guid {
+                    if let Ok(Some(err)) = fetch_log_error(client, token, guid).await {
                         log.error_message = Some(err);
                     }
                 }
@@ -155,6 +155,25 @@ pub async fn fetch_artifact_error(
     let error_url = format!(
         "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationRuntimeArtifacts('{}')/ErrorInformation/$value",
         artifact_id
+    );
+
+    let res = client.get(&error_url).bearer_auth(token).send().await?;
+
+    if res.status().is_success() {
+        Ok(Some(res.text().await?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn fetch_log_error(
+    client: &reqwest::Client,
+    token: &str,
+    message_guid: &str,
+) -> Result<Option<String>> {
+    let error_url = format!(
+        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs('{}')/ErrorInformation/$value",
+        message_guid
     );
 
     let res = client.get(&error_url).bearer_auth(token).send().await?;
