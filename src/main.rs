@@ -289,10 +289,8 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if app.last_refresh.elapsed() >= AUTO_REFRESH {
-            match refresh_views(&mut app, &pool).await {
-                Ok(()) => {}
-                Err(_) => {}
-            }
+            let limit = app.logs_limit;
+            let _ = load_data(&mut app, &pool, limit, false).await;
         }
     }
 
