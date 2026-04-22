@@ -69,7 +69,7 @@ Le projet est découpé en modules spécialisés pour garantir la maintenabilit�
 
 ---
 
-## ⚙️ Configuration & Installation
+## Configuration & Installation
 
 ### Pré-requis
 
@@ -93,7 +93,7 @@ Exécutez les scripts SQL nécessaires pour créer les tables : `sap_monitoring_
 
 ---
 
-## 🚀 Utilisation
+## Utilisation
 
 ### Lancement
 
