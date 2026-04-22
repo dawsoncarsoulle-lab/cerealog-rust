@@ -31,7 +31,7 @@ pub struct ODataData {
     pub results: Vec<LogEntry>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct IntegrationPackage {
     #[serde(alias = "Id", alias = "id")]
@@ -41,6 +41,13 @@ pub struct IntegrationPackage {
     pub vendor: Option<String>,
     #[serde(alias = "CreationDate", alias = "creationDate", alias = "Creationdate")]
     pub creation_date: Option<String>,
+
+    pub industries: Option<String>,
+    pub keywords: Option<String>,
+    pub products: Option<String>,
+    pub countries: Option<String>,
+    #[serde(alias = "LineOfBusiness", alias = "lineOfBusiness")]
+    pub line_of_business: Option<String>,
 
     #[serde(skip)]
     pub parsed_creation_date: Option<NaiveDateTime>,
@@ -99,4 +106,42 @@ pub struct ArtifactError {
     pub artifact_id: String,
     pub error_message: String,
     pub error_time: chrono::NaiveDateTime,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ODataDesignResponse {
+    pub d: ODataDesignData,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ODataDesignData {
+    pub results: Vec<DesigntimeArtifact>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+pub struct DesigntimeArtifact {
+    #[serde(alias = "Id", alias = "id")]
+    pub id: Option<String>,
+
+    #[serde(alias = "PackageId", alias = "packageId")]
+    pub package_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "PascalCase")]
+pub struct ArtifactConfiguration {
+    pub parameter_key: Option<String>,
+    pub parameter_value: Option<String>,
+    pub data_type: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ODataConfigResponse {
+    pub d: ODataConfigData,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ODataConfigData {
+    pub results: Vec<ArtifactConfiguration>,
 }

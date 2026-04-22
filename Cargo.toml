@@ -19,6 +19,7 @@ clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"
 ratatui = "0.26"
 crossterm = "0.27"
+futures = "0.3"
 
 [dependencies.indexmap]
 version = "=2.2.6"

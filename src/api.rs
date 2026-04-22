@@ -1,3 +1,6 @@
+use crate::models::{DesigntimeArtifact, ODataDesignResponse};
+
+const DESIGN_URL: &str = "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationDesigntimeArtifacts";
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime};
 use log::info;
@@ -25,17 +28,22 @@ fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
         }
     }
 
-    if let Ok(ms) = date_str.parse::<i64>() {
-        return DateTime::from_timestamp(ms / 1000, ((ms % 1000) * 1_000_000) as u32)
-            .map(|dt| dt.naive_utc());
-    }
-
     if date_str.len() >= 19 {
         let iso_part = &date_str[0..19];
         return NaiveDateTime::parse_from_str(iso_part, "%Y-%m-%dT%H:%M:%S").ok();
     }
 
     None
+}
+
+/// Construit un client HTTP réutilisable avec connection pooling activé.
+/// À appeler une seule fois et à passer en référence partout.
+pub fn build_http_client() -> Result<reqwest::Client> {
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()?;
+    Ok(client)
 }
 
 pub async fn get_sap_token(client: &reqwest::Client) -> Result<String> {
@@ -65,7 +73,11 @@ pub async fn fetch_sap_logs(
     top: u32,
     filter: Option<&str>,
 ) -> Result<Vec<LogEntry>> {
-    let mut url = format!("{}&$top={}", "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs?$orderby=LogStart desc", top);
+    let mut url = format!(
+        "{}&$top={}",
+        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs?$orderby=LogStart desc",
+        top
+    );
 
     if let Some(f) = filter {
         url.push_str(&format!("&$filter={}", f));
@@ -81,16 +93,36 @@ pub async fn fetch_sap_logs(
     if res.status().is_success() {
         let odata: ODataResponse = res.json().await?;
         let mut logs = odata.d.results;
+
+        let error_futs: Vec<_> = logs
+            .iter()
+            .filter(|l| l.status.as_deref() == Some("FAILED"))
+            .filter_map(|l| l.message_guid.clone())
+            .map(|guid| {
+                let client = client.clone();
+                let token = token.to_string();
+                async move {
+                    let err = fetch_log_error(&client, &token, &guid).await;
+                    (guid, err)
+                }
+            })
+            .collect();
+
+        let error_results = futures::future::join_all(error_futs).await;
+        let error_map: std::collections::HashMap<String, String> = error_results
+            .into_iter()
+            .filter_map(|(guid, res)| res.ok().flatten().map(|e| (guid, e)))
+            .collect();
+
         for log in &mut logs {
             log.parsed_date = clean_sap_date(log.log_start.as_deref());
-            if log.status.as_deref() == Some("FAILED") {
-                if let Some(guid) = &log.message_guid {
-                    if let Ok(Some(err)) = fetch_log_error(client, token, guid).await {
-                        log.error_message = Some(err);
-                    }
+            if let Some(guid) = &log.message_guid {
+                if let Some(err) = error_map.get(guid) {
+                    log.error_message = Some(err.clone());
                 }
             }
         }
+
         Ok(logs)
     } else {
         anyhow::bail!("❌ Erreur API SAP: {}", res.status());
@@ -182,5 +214,81 @@ pub async fn fetch_log_error(
         Ok(Some(res.text().await?))
     } else {
         Ok(None)
+    }
+}
+
+/// Récupère les designtime artifacts d'un package donné.
+pub async fn fetch_artifacts_for_package(
+    client: &reqwest::Client,
+    token: &str,
+    package_id: &str,
+) -> anyhow::Result<Vec<DesigntimeArtifact>> {
+    let url = format!(
+        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationPackages('{}')/IntegrationDesigntimeArtifacts",
+        package_id
+    );
+
+    let res = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if res.status().is_success() {
+        let odata: ODataDesignResponse = res.json().await?;
+        Ok(odata.d.results)
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Récupère en parallèle les designtime artifacts de tous les packages.
+/// Retourne une map package_id -> Vec<art_id>
+pub async fn fetch_all_package_artifacts(
+    client: &reqwest::Client,
+    token: &str,
+    package_ids: &[String],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let futs = package_ids.iter().map(|pkg_id| {
+        let client = client.clone();
+        let token = token.to_string();
+        let pkg_id = pkg_id.clone();
+        async move {
+            let arts = fetch_artifacts_for_package(&client, &token, &pkg_id)
+                .await
+                .unwrap_or_default();
+            let ids: Vec<String> = arts.into_iter().filter_map(|a| a.id).collect();
+            (pkg_id, ids)
+        }
+    });
+
+    futures::future::join_all(futs).await.into_iter().collect()
+}
+
+use crate::models::{ArtifactConfiguration, ODataConfigResponse};
+
+pub async fn fetch_artifact_properties(
+    client: &reqwest::Client,
+    token: &str,
+    artifact_id: &str,
+) -> anyhow::Result<Vec<ArtifactConfiguration>> {
+    let url = format!(
+        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationDesigntimeArtifacts(Id='{}',Version='active')/Configurations",
+        artifact_id
+    );
+
+    let res = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+
+    if res.status().is_success() {
+        let odata: ODataConfigResponse = res.json().await?;
+        Ok(odata.d.results)
+    } else {
+        Ok(vec![])
     }
 }
