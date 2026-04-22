@@ -27,116 +27,114 @@ This is a Rust TUI app (`sap-extractor`) that fetches SAP BTP integration logs a
 
 # SAP BTP Monitoring Tool (Rust TUI)
 
-Un tableau de bord interactif en terminal (TUI) conçu en **Rust** pour le monitoring en temps réel de **SAP Integration Suite (Cloud Integration)** sur SAP BTP.
+An interactive Terminal User Interface (TUI) dashboard built in **Rust**, designed for real-time monitoring of **SAP Integration Suite (Cloud Integration)** on SAP BTP.
 
-Cet outil permet d'extraire, de stocker et de visualiser les logs de traitement, l'état des artifacts, les packages d'intégration et leurs configurations techniques complexes avec une performance maximale.
+This tool extracts, stores, and visualizes processing logs, artifact statuses, integration packages, and complex technical configurations with maximum performance.
 
 ---
 
-## Fonctionnalités
+## Features
 
 ### Monitoring & Analytics
 
-- **Logs d'exécution** : Visualisation en temps réel des _Message Processing Logs_ avec récupération automatique des détails d'erreurs pour les messages échoués.
-- **Artifacts & Packages** : Inventaire complet des artifacts de runtime et des packages de design-time.
-- **Statistiques Avancées** : Graphiques Sparkline (activité sur 12h/24h) et BarCharts (erreurs sur 7j) pour identifier les tendances de pannes.
-- **Analytics** : Calcul du taux de succès global et répartition par statuts (COMPLETED, FAILED, STARTED, etc.).
+- **Execution Logs**: Real-time visualization of _Message Processing Logs_ with automatic retrieval of error details for failed messages.
+- **Artifacts & Packages**: Comprehensive inventory of runtime artifacts and design-time packages.
+- **Advanced Statistics**: Sparkline charts (12h/24h activity) and BarCharts (7-day error trends) to identify failure patterns.
+- **Analytics**: Global success rate calculation and status distribution (COMPLETED, FAILED, STARTED, etc.).
 
-### Recherche & Audit
+### Search & Audit
 
-- **Moteur de recherche dynamique** : Filtrage instantané sur tous les tableaux avec **surlignage (highlighting)** des correspondances.
-- **Vue détaillée (Popup)** : Analyse approfondie d'un artifact incluant ses **propriétés de configuration** (Externalized Parameters) et ses erreurs de déploiement.
-- **Tags SAP** : Récupération et fusion des métadonnées SAP (_Industries, Keywords, Products, etc._) pour un meilleur classement.
+- **Dynamic Search Engine**: Instant filtering across all tables with visual **highlighting** of matches.
+- **Detailed View (Popup)** : Deep analysis of an artifact, including its **externalized parameters** (configuration properties) and deployment errors.
+- **SAP Tags**: Retrieval and merging of SAP metadata (_Industries, Keywords, Products, etc._) for improved classification.
 
-### Performance & Robustesse
+### Performance & Robustness
 
-- **Moteur Asynchrone** : Propulsé par `Tokio` pour des opérations non-bloquantes.
-- **Limitation de Concurrence** : Utilisation de `Streams` avec `buffer_unordered(50)` pour traiter les centaines de requêtes API SAP sans saturation.
-- **Persistance PostgreSQL** : Stockage local avec `SQLx` et transactions groupées (`bulk update`) pour une réactivité maximale de l'UI.
+- **Asynchronous Engine**: Powered by `Tokio` for non-blocking operations.
+- **Concurrency Throttling**: Utilizes `Streams` with `buffer_unordered(50)` to handle hundreds of SAP API requests without saturation.
+- **PostgreSQL Persistence**: Local storage via `SQLx` with `bulk update` transactions for maximum UI responsiveness.
 
 ---
 
-## Architecture Technique
+## Technical Architecture
 
-Le projet est découpé en modules spécialisés pour garantir la maintenabilité :
+The project is modularized to ensure maintainability:
 
-- **`api.rs`** : Gestionnaire de requêtes OData, client HTTP optimisé (connection pooling) et authentification OAuth2.
-- **`db.rs`** : Couche d'accès aux données (DAL) gérant les insertions et les mises à jour en base PostgreSQL.
-- **`models.rs`** : Définitions des structures de données pour le désérialisation JSON (Serde) et les vues SQL.
-- **`queries.rs`** : Centralisation des requêtes de lecture complexes pour les statistiques et l'interface.
-- **`ui.rs`** : Cœur de l'interface utilisateur utilisant `Ratatui`. Gère le rendu des onglets, les événements clavier et le moteur de surlignage.
-- **`main.rs`** : Orchestrateur principal gérant le cycle de vie de l'application et la synchronisation des données.
+- **`api.rs`**: OData request manager, optimized HTTP client (connection pooling), and OAuth2 authentication.
+- **`db.rs`**: Data Access Layer (DAL) managing PostgreSQL insertions and updates.
+- **`models.rs`**: Data structure definitions for JSON deserialization (Serde) and SQL views.
+- **`queries.rs`**: Centralized complex read queries for statistics and the interface.
+- **`ui.rs`**: The core UI using `Ratatui`. Handles tab rendering, keyboard events, and the highlighting engine.
+- **`main.rs`**: Main orchestrator managing the application lifecycle and data synchronization.
 
 ---
 
 ## Configuration & Installation
 
-### Pré-requis
+### Prerequisites
 
-- **Rust** (dernière version stable)
-- **PostgreSQL** (avec une base de données créée)
-- Accès **SAP BTP Integration Suite** (Client ID / Secret avec scope Monitoring)
+- **Rust** (Latest stable version)
 
-### Variables d'environnement (`.env`)
+Rust can be installed using the following command:
 
-Crée un fichier `.env` à la racine du projet :
+```zsh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+- **PostgreSQL** (With a database already created)
+
+Execute the `table.sql` file to create the required tables.
+
+- **SAP BTP Integration Suite** Access (Client ID / Secret with Monitoring scope)
+
+### Environment Variables (`.env`)
+
+Create a `.env` file at the root of the project:
 
 ```env
 DATABASE_URL=postgres://user:password@localhost/sap_monitoring
-CLIENT_ID=votre_client_id
-CLIENT_SECRET=votre_client_secret
+CLIENT_ID=your_client_id
+CLIENT_SECRET=your_client_secret
 SAP_BASE_URL='https://xxx.it-cpi001.cfapps.eu10.hana.ondemand.com'
 SAP_TOKEN_URL='https://xxx.authentication.eu10.hana.ondemand.com/oauth/token?grant_type=client_credentials&token_format=jwt'
-
 ```
 
-### Initialisation de la Base de Données
+### Database Initialization
 
-Exécutez les scripts SQL nécessaires pour créer les tables : `sap_monitoring_logs`, `integration_packages`, `runtime_artifacts`, `artifact_errors` et `artifact_configurations`.
+Run the necessary SQL scripts to create the tables: `sap_monitoring_logs`, `integration_packages`, `runtime_artifacts`, `artifact_errors`, and `artifact_configurations`.
 
 ---
 
-## Utilisation
+## Usage
 
-### Lancement
+### Launching
 
-Pour des performances optimales (fortement recommandé), utilisez le mode **release** :
+For optimal performance (highly recommended), use **release** mode:
 
 ```bash
 cargo run --release
 ```
 
-### Raccourcis Clavier
+### Keyboard Shortcuts
 
-| Touche     | Action                                                    |
-| :--------- | :-------------------------------------------------------- |
-| **Tab**    | Naviguer entre les onglets (Logs, Artifacts, Packages...) |
-| **j / k**  | Naviguer dans les listes (Haut / Bas)                     |
-| **Entrée** | Voir le détail d'un artifact (Propriétés / Erreur)        |
-| **r**      | Forcer une re-extraction complète depuis SAP              |
-| **f**      | Filtrer uniquement les logs en échec (FAILED)             |
-| **+**      | Charger 500 logs supplémentaires dans l'historique        |
-| **Texte**  | Taper directement pour rechercher/filtrer                 |
-| **Esc**    | Effacer le filtre actuel / Fermer un popup                |
-| **q**      | Quitter l'application                                     |
-
----
-
-## 📈 Optimisations Réseau
-
-L'outil utilise une stratégie de récupération de données en plusieurs vagues pour contourner les limitations de l'API SAP :
-
-1.  **Extraction Global** : Logs, Packages et Artifacts en parallèle (`tokio::join!`).
-2.  **Lien Design/Runtime** : Bouclage sur les packages pour associer les artifacts via l'API DesignTime.
-3.  **Audit Profond** : Extraction massive des configurations (`Configurations API`) en flux parallèle limité à 50 requêtes simultanées pour éviter le bannissement IP.
+| Key       | Action                                               |
+| :-------- | :--------------------------------------------------- |
+| **Tab**   | Navigate between tabs (Logs, Artifacts, Packages...) |
+| **j / k** | Navigate through lists (Up / Down)                   |
+| **Enter** | View artifact details (Properties / Error)           |
+| **r**     | Force a full re-extraction from SAP                  |
+| **f**     | Filter only FAILED logs                              |
+| **+**     | Load 500 additional logs into history                |
+| **Text**  | Type directly to search/filter                       |
+| **Esc**   | Clear current filter / Close popup                   |
+| **q**     | Quit application                                     |
 
 ---
 
-### Références des fichiers sources
+## 📈 Network Optimizations
 
-- Logique API et Réseau : `src/api.rs`
-- Gestion de la Base de données : `src/db.rs`
-- Interface Utilisateur (Ratatui) : `src/ui.rs`
-- Orchestration des données : `src/main.rs`
-- Modèles de données : `src/models.rs`
-- Requêtes de lecture : `src/queries.rs`
+The tool uses a multi-wave data retrieval strategy to bypass SAP API limitations:
+
+1.  **Global Extraction**: Parallel fetching of Logs, Packages, and Artifacts (`tokio::join!`).
+2.  **Design/Runtime Linking**: Loops through packages to associate artifacts via the DesignTime API.
+3.  **Deep Audit**: Massive extraction of configurations (`Configurations API`) using a parallel stream limited to 50 simultaneous requests to prevent IP rate-limiting.
