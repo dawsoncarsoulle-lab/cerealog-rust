@@ -1,23 +1,16 @@
+use crate::config::{SapConfig, TokenCache};
 use crate::models::{DesigntimeArtifact, ODataDesignResponse};
-
-const DESIGN_URL: &str = "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationDesigntimeArtifacts";
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime};
-use log::info;
+use log::{info, warn};
 use regex::Regex;
 
 use crate::models::{
-    IntegrationPackage, LogEntry, ODataArtifactResponse, ODataPackageResponse, ODataResponse,
-    RuntimeArtifact, TokenResponse,
+    ArtifactConfiguration, IntegrationPackage, LogEntry, ODataArtifactResponse,
+    ODataConfigResponse, ODataPackageResponse, ODataResponse, RuntimeArtifact, TokenResponse,
 };
 
-const TOKEN_URL: &str = "https://crldevintegration.authentication.eu10.hana.ondemand.com/oauth/token?grant_type=client_credentials&token_format=jwt";
-
-const PACKAGES_URL: &str =
-    "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationPackages";
-
-const ARTIFACTS_URL: &str =
-    "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationRuntimeArtifacts";
+// ─── Parsing des dates SAP ────────────────────────────────────────────────────
 
 fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
     let date_str = raw_date?;
@@ -39,7 +32,9 @@ fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
     None
 }
 
-/// Construit un client HTTP réutilisable avec connection pooling activé.
+// ─── HTTP client ─────────────────────────────────────────────────────────────
+
+/// Construit un client HTTP réutilisable avec connection pooling.
 pub fn build_http_client() -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(50)
@@ -48,17 +43,14 @@ pub fn build_http_client() -> Result<reqwest::Client> {
     Ok(client)
 }
 
-pub async fn get_sap_token(client: &reqwest::Client) -> Result<String> {
+// ─── Token OAuth ─────────────────────────────────────────────────────────────
+
+pub async fn get_sap_token(client: &reqwest::Client, config: &SapConfig) -> Result<TokenCache> {
     info!("Demande du jeton d'accès OAuth...");
 
-    let client_id = std::env::var("CLIENT_ID")
-        .expect("Variable CLIENT_ID introuvable (vérifie ton fichier .env)");
-    let client_secret = std::env::var("CLIENT_SECRET")
-        .expect("Variable CLIENT_SECRET introuvable (vérifie ton fichier .env)");
-
     let token_res = client
-        .post(TOKEN_URL)
-        .basic_auth(client_id, Some(client_secret))
+        .post(&config.token_url)
+        .basic_auth(&config.client_id, Some(&config.client_secret))
         .send()
         .await?
         .error_for_status()?;
@@ -66,26 +58,36 @@ pub async fn get_sap_token(client: &reqwest::Client) -> Result<String> {
     let token_data: TokenResponse = token_res.json().await?;
     info!("Jeton obtenu !");
 
-    Ok(token_data.access_token)
+    // TTL par défaut de 3600s (1h), on renouvelle 60s avant
+    Ok(TokenCache::new(token_data.access_token, 3500))
 }
+
+/// Renouvelle le token s'il est expiré, sinon le retourne tel quel.
+pub async fn ensure_valid_token(
+    client: &reqwest::Client,
+    config: &SapConfig,
+    cache: &mut TokenCache,
+) -> Result<()> {
+    if cache.is_expired() {
+        let new_token = get_sap_token(client, config).await?;
+        cache.refresh(new_token.token, 3500);
+    }
+    Ok(())
+}
+
+// ─── Logs ─────────────────────────────────────────────────────────────────────
 
 pub async fn fetch_sap_logs(
     client: &reqwest::Client,
     token: &str,
+    config: &SapConfig,
     top: u32,
     filter: Option<&str>,
+    concurrency: usize,
 ) -> Result<Vec<LogEntry>> {
     use futures::stream::{self, StreamExt};
 
-    let mut url = format!(
-        "{}&$top={}",
-        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs?$orderby=LogStart desc",
-        top
-    );
-
-    if let Some(f) = filter {
-        url.push_str(&format!("&$filter={}", f));
-    }
+    let url = config.logs_url(top, filter);
 
     let res = client
         .get(&url)
@@ -98,25 +100,33 @@ pub async fn fetch_sap_logs(
         let odata: ODataResponse = res.json().await?;
         let mut logs = odata.d.results;
 
-        let error_stream = stream::iter(
-            logs.iter()
-                .filter(|l| l.status.as_deref() == Some("FAILED"))
-                .filter_map(|l| l.message_guid.clone())
-                .map(|guid| {
-                    let client = client.clone();
-                    let token = token.to_string();
-                    async move {
-                        let err = fetch_log_error(&client, &token, &guid).await;
-                        (guid, err)
-                    }
-                }),
-        );
+        let failed_guids: Vec<String> = logs
+            .iter()
+            .filter(|l| l.status.as_deref() == Some("FAILED"))
+            .filter_map(|l| l.message_guid.clone())
+            .collect();
 
-        let error_results: Vec<_> = error_stream.buffer_unordered(50).collect().await;
+        let error_stream = stream::iter(failed_guids.into_iter().map(|guid| {
+            let client = client.clone();
+            let token = token.to_string();
+            let error_url = config.log_error_url(&guid);
+            async move {
+                let err = fetch_error_from_url(&client, &token, &error_url).await;
+                (guid, err)
+            }
+        }));
+
+        let error_results: Vec<_> = error_stream.buffer_unordered(concurrency).collect().await;
 
         let error_map: std::collections::HashMap<String, String> = error_results
             .into_iter()
-            .filter_map(|(guid, res)| res.ok().flatten().map(|e| (guid, e)))
+            .filter_map(|(guid, res)| {
+                res.unwrap_or_else(|e| {
+                    warn!("Échec fetch erreur log {}: {}", guid, e);
+                    None
+                })
+                .map(|e| (guid, e))
+            })
             .collect();
 
         for log in &mut logs {
@@ -130,17 +140,20 @@ pub async fn fetch_sap_logs(
 
         Ok(logs)
     } else {
-        anyhow::bail!("❌ Erreur API SAP: {}", res.status());
+        anyhow::bail!("❌ Erreur API SAP logs: {}", res.status());
     }
 }
+
+// ─── Packages ────────────────────────────────────────────────────────────────
 
 pub async fn fetch_packages(
     client: &reqwest::Client,
     token: &str,
-) -> anyhow::Result<Vec<IntegrationPackage>> {
+    config: &SapConfig,
+) -> Result<Vec<IntegrationPackage>> {
     log::info!("Téléchargement des Integration Packages...");
     let res = client
-        .get(PACKAGES_URL)
+        .get(&config.packages_url())
         .bearer_auth(token)
         .header("Accept", "application/json")
         .send()
@@ -159,13 +172,16 @@ pub async fn fetch_packages(
     }
 }
 
+// ─── Artifacts runtime ───────────────────────────────────────────────────────
+
 pub async fn fetch_artifacts(
     client: &reqwest::Client,
     token: &str,
-) -> anyhow::Result<Vec<RuntimeArtifact>> {
+    config: &SapConfig,
+) -> Result<Vec<RuntimeArtifact>> {
     log::info!("Téléchargement des Runtime Artifacts...");
     let res = client
-        .get(ARTIFACTS_URL)
+        .get(&config.artifacts_url())
         .bearer_auth(token)
         .header("Accept", "application/json")
         .send()
@@ -184,54 +200,50 @@ pub async fn fetch_artifacts(
     }
 }
 
-pub async fn fetch_artifact_error(
+// ─── Erreurs ─────────────────────────────────────────────────────────────────
+
+async fn fetch_error_from_url(
     client: &reqwest::Client,
     token: &str,
-    artifact_id: &str,
+    url: &str,
 ) -> Result<Option<String>> {
-    let error_url = format!(
-        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationRuntimeArtifacts('{}')/ErrorInformation/$value",
-        artifact_id
-    );
-
-    let res = client.get(&error_url).bearer_auth(token).send().await?;
-
+    let res = client.get(url).bearer_auth(token).send().await?;
     if res.status().is_success() {
         Ok(Some(res.text().await?))
     } else {
         Ok(None)
     }
+}
+
+pub async fn fetch_artifact_error(
+    client: &reqwest::Client,
+    token: &str,
+    config: &SapConfig,
+    artifact_id: &str,
+) -> Result<Option<String>> {
+    let url = config.artifact_error_url(artifact_id);
+    fetch_error_from_url(client, token, &url).await
 }
 
 pub async fn fetch_log_error(
     client: &reqwest::Client,
     token: &str,
+    config: &SapConfig,
     message_guid: &str,
 ) -> Result<Option<String>> {
-    let error_url = format!(
-        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/MessageProcessingLogs('{}')/ErrorInformation/$value",
-        message_guid
-    );
-
-    let res = client.get(&error_url).bearer_auth(token).send().await?;
-
-    if res.status().is_success() {
-        Ok(Some(res.text().await?))
-    } else {
-        Ok(None)
-    }
+    let url = config.log_error_url(message_guid);
+    fetch_error_from_url(client, token, &url).await
 }
 
-/// Récupère les designtime artifacts d'un package donné.
+// ─── Designtime artifacts ────────────────────────────────────────────────────
+
 pub async fn fetch_artifacts_for_package(
     client: &reqwest::Client,
     token: &str,
+    config: &SapConfig,
     package_id: &str,
-) -> anyhow::Result<Vec<DesigntimeArtifact>> {
-    let url = format!(
-        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationPackages('{}')/IntegrationDesigntimeArtifacts",
-        package_id
-    );
+) -> Result<Vec<DesigntimeArtifact>> {
+    let url = config.package_artifacts_url(package_id);
 
     let res = client
         .get(&url)
@@ -244,6 +256,11 @@ pub async fn fetch_artifacts_for_package(
         let odata: ODataDesignResponse = res.json().await?;
         Ok(odata.d.results)
     } else {
+        warn!(
+            "Échec fetch artifacts pour package {}: HTTP {}",
+            package_id,
+            res.status()
+        );
         Ok(vec![])
     }
 }
@@ -251,7 +268,9 @@ pub async fn fetch_artifacts_for_package(
 pub async fn fetch_all_package_artifacts(
     client: &reqwest::Client,
     token: &str,
+    config: &SapConfig,
     package_ids: &[String],
+    concurrency: usize,
 ) -> std::collections::HashMap<String, Vec<String>> {
     use futures::stream::{self, StreamExt};
 
@@ -259,34 +278,36 @@ pub async fn fetch_all_package_artifacts(
         let client = client.clone();
         let token = token.to_string();
         let pkg_id = pkg_id.clone();
+        let config = config.clone();
         async move {
-            let arts = fetch_artifacts_for_package(&client, &token, &pkg_id)
+            let arts = fetch_artifacts_for_package(&client, &token, &config, &pkg_id)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    warn!("Erreur fetch package {}: {}", pkg_id, e);
+                    vec![]
+                });
             let ids: Vec<String> = arts.into_iter().filter_map(|a| a.id).collect();
             (pkg_id, ids)
         }
     }));
 
     stream
-        .buffer_unordered(50)
+        .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect()
 }
 
-use crate::models::{ArtifactConfiguration, ODataConfigResponse};
+// ─── Configurations ──────────────────────────────────────────────────────────
 
 pub async fn fetch_artifact_properties(
     client: &reqwest::Client,
     token: &str,
+    config: &SapConfig,
     artifact_id: &str,
-) -> anyhow::Result<Vec<ArtifactConfiguration>> {
-    let url = format!(
-        "https://crldevintegration.it-cpi001.cfapps.eu10.hana.ondemand.com/api/v1/IntegrationDesigntimeArtifacts(Id='{}',Version='active')/Configurations",
-        artifact_id
-    );
+) -> Result<Vec<ArtifactConfiguration>> {
+    let url = config.artifact_configs_url(artifact_id);
 
     let res = client
         .get(&url)
@@ -299,6 +320,11 @@ pub async fn fetch_artifact_properties(
         let odata: ODataConfigResponse = res.json().await?;
         Ok(odata.d.results)
     } else {
+        warn!(
+            "Échec fetch configs pour artifact {}: HTTP {}",
+            artifact_id,
+            res.status()
+        );
         Ok(vec![])
     }
 }

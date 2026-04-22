@@ -1,6 +1,6 @@
 [package]
 name = "sap-extractor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,10 @@ indicatif = "0.17"
 ratatui = "0.26"
 crossterm = "0.27"
 futures = "0.3"
+
+# Persistance de la config utilisateur
+dirs = "5"
+toml = "0.8"
 
 [dependencies.indexmap]
 version = "=2.2.6"

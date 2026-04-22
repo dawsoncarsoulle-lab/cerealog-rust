@@ -19,7 +19,6 @@ pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
     app.errors = errors_res?;
     app.configs = configs_res?;
 
-    // ── Groupe 2 : stats & graphiques (parallèle) ────────────────────────────
     let (stats_res, hourly_res, daily_res, activity_res, top_errors_res, log_st_res, art_st_res) = tokio::join!(
         fetch_stats(pool),
         fetch_hourly_errors(pool),

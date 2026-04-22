@@ -1,3 +1,4 @@
+use crate::config::UserConfig;
 use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -38,17 +39,11 @@ const C_SEL_BG: Color = Color::Rgb(50, 40, 90);
 
 // ─── Événements retournés à main ─────────────────────────────────────────────
 
-/// Remplace le détournement de OverlayState pour communiquer avec main.rs.
-/// run_tui() retourne un AppEvent, main.rs réagit en conséquence.
 #[derive(Debug, PartialEq)]
 pub enum AppEvent {
-    /// L'utilisateur veut quitter.
     Quit,
-    /// L'utilisateur a demandé une re-extraction complète (touche 'r').
     Refresh,
-    /// L'utilisateur veut charger plus de logs (touche '+').
     LoadMore,
-    /// Rien de spécial, boucle normale (auto-refresh éventuel).
     Continue,
 }
 
@@ -99,9 +94,16 @@ pub enum OverlayState {
         error: Option<String>,
         configs: Vec<(String, String)>,
     },
+    LogDetail {
+        guid: String,
+        status: String,
+        date: String,
+        flow: String,
+        error: String,
+    },
 }
 
-// ─── Stats (publiques pour queries.rs) ───────────────────────────────────────
+// ─── Stats ───────────────────────────────────────────────────────────────────
 
 pub struct Stats {
     pub total_logs: i64,
@@ -126,8 +128,8 @@ impl Default for Stats {
 pub struct App {
     pub active_tab: Tab,
 
-    /// Un TableState par onglet, pour que la sélection soit indépendante.
-    table_states: [TableState; 4], // Logs, Artifacts, Packages, Errors
+    // Un TableState par onglet (5 onglets, Analytics a le sien propre même si pas de table)
+    table_states: [TableState; 5],
 
     pub logs: Vec<LogView>,
     pub artifacts: Vec<ArtifactView>,
@@ -151,35 +153,25 @@ pub struct App {
     pub overlay: OverlayState,
     pub last_tick: Instant,
     pub last_refresh: Instant,
+    pub user_config: UserConfig,
 }
 
 impl App {
-    pub fn new() -> Self {
-        let mut ts = TableState::default();
-        ts.select(Some(0));
+    pub fn new(user_config: UserConfig) -> Self {
+        let logs_limit = user_config.logs_limit;
+        let make_state = || {
+            let mut s = TableState::default();
+            s.select(Some(0));
+            s
+        };
         Self {
             active_tab: Tab::Logs,
             table_states: [
-                {
-                    let mut s = TableState::default();
-                    s.select(Some(0));
-                    s
-                },
-                {
-                    let mut s = TableState::default();
-                    s.select(Some(0));
-                    s
-                },
-                {
-                    let mut s = TableState::default();
-                    s.select(Some(0));
-                    s
-                },
-                {
-                    let mut s = TableState::default();
-                    s.select(Some(0));
-                    s
-                },
+                make_state(),
+                make_state(),
+                make_state(),
+                make_state(),
+                make_state(), // Analytics — propre TableState, non partagé
             ],
             logs: vec![],
             artifacts: vec![],
@@ -199,10 +191,11 @@ impl App {
             filtered_packages: vec![],
             filtered_errors: vec![],
             stats: Stats::default(),
-            logs_limit: 200,
+            logs_limit,
             overlay: OverlayState::Hidden,
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
+            user_config,
         }
     }
 
@@ -212,7 +205,7 @@ impl App {
             Tab::Artifacts => 1,
             Tab::Packages => 2,
             Tab::Errors => 3,
-            Tab::Analytics => 0,
+            Tab::Analytics => 4, // Corrigé : index dédié, ne partage plus avec Logs
         }
     }
 
@@ -221,7 +214,6 @@ impl App {
         &mut self.table_states[i]
     }
 
-    /// Retourne la sélection de l'onglet actif
     pub fn selected(&self) -> Option<usize> {
         let i = Self::tab_index(self.active_tab);
         self.table_states[i].selected()
@@ -372,6 +364,17 @@ impl App {
             *spinner_tick = spinner_tick.wrapping_add(1);
         }
     }
+
+    /// Génère une sparkline sur `num_points` points, en remplissant les trous avec 0.
+    pub fn padded_sparkline(data: &[u64], num_points: usize) -> Vec<u64> {
+        if data.len() >= num_points {
+            data[data.len() - num_points..].to_vec()
+        } else {
+            let mut padded = vec![0u64; num_points - data.len()];
+            padded.extend_from_slice(data);
+            padded
+        }
+    }
 }
 
 // ─── Entrée TUI ──────────────────────────────────────────────────────────────
@@ -418,7 +421,8 @@ fn run_loop<B: ratatui::backend::Backend>(
                 match &app.overlay {
                     OverlayState::Done { .. }
                     | OverlayState::Error { .. }
-                    | OverlayState::ArtifactDetail { .. } => {
+                    | OverlayState::ArtifactDetail { .. }
+                    | OverlayState::LogDetail { .. } => {
                         if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                             app.overlay = OverlayState::Hidden;
                         }
@@ -473,6 +477,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                         return Ok(AppEvent::LoadMore);
                     }
 
+                    // Overlay détail pour les Artifacts
                     KeyCode::Enter if app.active_tab == Tab::Artifacts => {
                         if let Some(i) = app.selected() {
                             if let Some(art) = app.filtered_artifacts.get(i) {
@@ -493,6 +498,32 @@ fn run_loop<B: ratatui::backend::Backend>(
                                     status: art.status.clone().unwrap_or_default(),
                                     error,
                                     configs: art_configs,
+                                };
+                            }
+                        }
+                    }
+
+                    // Overlay détail pour les Logs (message d'erreur complet)
+                    KeyCode::Enter if app.active_tab == Tab::Logs => {
+                        if let Some(i) = app.selected() {
+                            if let Some(log) = app.filtered_logs.get(i) {
+                                app.overlay = OverlayState::LogDetail {
+                                    guid: log
+                                        .message_guid
+                                        .clone()
+                                        .unwrap_or_else(|| "—".to_string()),
+                                    status: log.status.clone().unwrap_or_else(|| "—".to_string()),
+                                    date: log
+                                        .parsed_date
+                                        .map(|d| d.format("%d/%m/%Y %H:%M:%S").to_string())
+                                        .unwrap_or_else(|| "—".to_string()),
+                                    flow: log
+                                        .integration_flow_name
+                                        .clone()
+                                        .unwrap_or_else(|| "—".to_string()),
+                                    error: log.error_message.clone().unwrap_or_else(|| {
+                                        "Aucune information d'erreur.".to_string()
+                                    }),
                                 };
                             }
                         }
@@ -548,7 +579,6 @@ fn draw(f: &mut Frame, app: &mut App) {
 
 // ─── Header / Tabs ───────────────────────────────────────────────────────────
 
-/// Badge "[filtré/total]" — montre le filtrage en cours
 fn tab_label(tab: Tab, app: &App) -> Line<'static> {
     let (name, counts, is_alert) = match tab {
         Tab::Logs => (
@@ -750,6 +780,8 @@ fn draw_stats_and_charts(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(cols[1]);
 
+    // Sparkline avec 24 points (1 par heure), trous remplis avec 0
+    let sparkline_data = App::padded_sparkline(&app.error_sparkline, 24);
     let spark = Sparkline::default()
         .block(
             Block::default()
@@ -758,7 +790,7 @@ fn draw_stats_and_charts(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(C_BORDER))
                 .border_type(BorderType::Rounded),
         )
-        .data(&app.error_sparkline)
+        .data(&sparkline_data)
         .style(Style::default().fg(C_RED));
     f.render_widget(spark, chart_rows[0]);
 
@@ -929,11 +961,11 @@ fn draw_logs_master_detail(f: &mut Frame, app: &mut App, area: Rect) {
                 .as_deref()
                 .unwrap_or("Aucune information d'erreur.");
             format!(
-                "GUID    : {}\nDate    : {}\nStatut  : {}\nFlow    : {}\n\nErreur  :\n{}",
+                "GUID    : {}\nDate    : {}\nStatut  : {}\nFlow    : {}\n\nErreur  :\n{}\n\n[Entrée] pour afficher l'erreur complète",
                 guid, date, status, flow, err
             )
         })
-        .unwrap_or_else(|| "Sélectionnez une ligne pour voir le détail technique.".to_string());
+        .unwrap_or_else(|| "Sélectionnez une ligne · [Entrée] pour le détail complet".to_string());
 
     let border_color = selected_log
         .and_then(|l| l.status.as_deref())
@@ -948,7 +980,7 @@ fn draw_logs_master_detail(f: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .title(Span::styled(
-                    " Vue Détaillée ",
+                    " Vue Détaillée — [Entrée] pour tout afficher ",
                     Style::default()
                         .fg(border_color)
                         .add_modifier(Modifier::BOLD),
@@ -1445,6 +1477,8 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         .value_style(Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD));
     f.render_widget(bc, top[1]);
 
+    // Sparkline activité avec 12 points (1 par heure sur 12h), trous remplis avec 0
+    let activity_data = App::padded_sparkline(&app.activity_sparkline, 12);
     let spark = Sparkline::default()
         .block(
             Block::default()
@@ -1454,7 +1488,7 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(C_BORDER))
                 .style(Style::default().bg(C_SURFACE)),
         )
-        .data(&app.activity_sparkline)
+        .data(&activity_data)
         .style(Style::default().fg(C_BLUE));
     f.render_widget(spark, bottom[0]);
 
@@ -1526,8 +1560,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         let shortcuts = [
             ("↑↓ / j k", "naviguer"),
             ("Tab", "onglets"),
+            ("Enter", "détail"),
             ("type", "rechercher"),
-            ("Esc", "effacer filtre"),
+            ("Esc", "effacer"),
             ("f", "filtre erreurs"),
             ("+", "500 logs de plus"),
             ("r", "re-extraire"),
@@ -1565,6 +1600,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
+    // ── Overlay ArtifactDetail ─────────────────────────────────────────────
     if let OverlayState::ArtifactDetail {
         name,
         status,
@@ -1573,9 +1609,8 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
     } = &app.overlay
     {
         let popup_height = 14 + configs.len() as u16;
-
         let popup_area = Rect {
-            x: area.x + area.width.saturating_sub(80) / 2, // Plus large (80 au lieu de 70)
+            x: area.x + area.width.saturating_sub(80) / 2,
             y: area.y + area.height.saturating_sub(popup_height) / 2,
             width: 80.min(area.width),
             height: popup_height.min(area.height),
@@ -1658,6 +1693,88 @@ fn draw_overlay(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // ── Overlay LogDetail ─────────────────────────────────────────────────
+    if let OverlayState::LogDetail {
+        guid,
+        status,
+        date,
+        flow,
+        error,
+    } = &app.overlay
+    {
+        let popup_height = 18u16;
+        let popup_width = 90u16;
+        let popup_area = Rect {
+            x: area.x + area.width.saturating_sub(popup_width) / 2,
+            y: area.y + area.height.saturating_sub(popup_height) / 2,
+            width: popup_width.min(area.width),
+            height: popup_height.min(area.height),
+        };
+        f.render_widget(Clear, popup_area);
+
+        let color = match status.as_str() {
+            "COMPLETED" => C_GREEN,
+            "FAILED" => C_RED,
+            _ => C_AMBER,
+        };
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Statut      : ", Style::default().fg(C_TEXT_DIM)),
+                Span::styled(
+                    status.clone(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Date        : ", Style::default().fg(C_TEXT_DIM)),
+                Span::styled(date.clone(), Style::default().fg(C_TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Flow        : ", Style::default().fg(C_TEXT_DIM)),
+                Span::styled(flow.clone(), Style::default().fg(C_BLUE)),
+            ]),
+            Line::from(vec![
+                Span::styled(" GUID        : ", Style::default().fg(C_TEXT_DIM)),
+                Span::styled(guid.clone(), Style::default().fg(C_ACCENT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Message d'erreur complet :",
+                Style::default().fg(C_TEXT_DIM),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(" {}", error),
+                Style::default().fg(C_RED),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                " Esc / Entrée pour fermer",
+                Style::default().fg(C_TEXT_FAINT),
+            )),
+        ];
+
+        let body = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " Détail du log ",
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(color))
+                    .style(Style::default().bg(C_SURFACE2)),
+            )
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(body, popup_area);
+        return;
+    }
+
+    // ── Overlay générique (Running / Done / Error) ────────────────────────
     let popup_area = Rect {
         x: area.x + area.width.saturating_sub(52) / 2,
         y: area.y + area.height.saturating_sub(7) / 2,

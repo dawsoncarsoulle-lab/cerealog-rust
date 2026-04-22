@@ -145,7 +145,7 @@ pub async fn insert_artifact_error(pool: &sqlx::PgPool, error: ArtifactError) ->
     Ok(())
 }
 
-/// Met à jour le package_id de plusieurs artifacts en une seule transaction.
+/// Mise à jour batch des package_id via UNNEST — remplace le N+1 transactionnel.
 pub async fn bulk_update_artifact_package(
     pool: &sqlx::PgPool,
     mappings: &[(String, String)],
@@ -154,15 +154,19 @@ pub async fn bulk_update_artifact_package(
         return Ok(());
     }
 
-    let mut tx = pool.begin().await?;
-    for (pkg_id, art_id) in mappings {
-        sqlx::query("UPDATE runtime_artifacts SET package_id = $1 WHERE id = $2")
-            .bind(pkg_id)
-            .bind(art_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
+    let pkg_ids: Vec<&str> = mappings.iter().map(|(p, _)| p.as_str()).collect();
+    let art_ids: Vec<&str> = mappings.iter().map(|(_, a)| a.as_str()).collect();
+
+    sqlx::query(
+        "UPDATE runtime_artifacts SET package_id = updates.pkg_id
+         FROM UNNEST($1::text[], $2::text[]) AS updates(pkg_id, art_id)
+         WHERE runtime_artifacts.id = updates.art_id",
+    )
+    .bind(&pkg_ids)
+    .bind(&art_ids)
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -227,4 +231,13 @@ pub async fn insert_configurations(
 
     qb.build().execute(pool).await?;
     Ok(())
+}
+
+/// Retourne le timestamp du log le plus récent en base, pour le fetch incrémental.
+pub async fn get_latest_log_date(pool: &sqlx::PgPool) -> Result<Option<chrono::NaiveDateTime>> {
+    let row: Option<(Option<chrono::NaiveDateTime>,)> =
+        sqlx::query_as("SELECT MAX(parsed_date) FROM sap_monitoring_logs")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(d,)| d))
 }
