@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sap_user
+      POSTGRES_PASSWORD: sap_password
+      POSTGRES_DB: sap_monitoring
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  sap-monitor:
+    build: .
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://sap_user:sap_password@db:5432/sap_monitoring
+    stdin_open: true
+    tty: true
+
+volumes:
+  pgdata:
