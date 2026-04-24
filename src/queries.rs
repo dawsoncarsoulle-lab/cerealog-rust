@@ -1,25 +1,32 @@
 use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
-use crate::ui::{App, Stats};
+use crate::models::{RefreshData, Stats};
 use anyhow::Result;
 use std::collections::HashMap;
 
-/// Rafraîchit toutes les données de l'App depuis la BDD.
-pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
-    let (logs_res, artifacts_res, packages_res, errors_res, configs_res) = tokio::join!(
-        fetch_logs(pool, app.logs_limit),
+/// Construit le payload complet de rafraîchissement.
+/// Appelé par le worker en arrière-plan, jamais par le thread UI.
+pub async fn build_refresh_data(pool: &sqlx::PgPool, logs_limit: u32) -> Result<RefreshData> {
+    let (
+        logs_res,
+        exec_errors_res,
+        artifacts_res,
+        packages_res,
+        deploy_errors_res,
+        configs_res,
+        stats_res,
+        hourly_res,
+        daily_res,
+        activity_res,
+        top_errors_res,
+        log_st_res,
+        art_st_res,
+    ) = tokio::join!(
+        fetch_logs(pool, logs_limit),
+        fetch_exec_errors(pool),
         fetch_artifacts(pool),
         fetch_packages(pool),
-        fetch_errors(pool),
+        fetch_deploy_errors(pool),
         fetch_all_configs(pool),
-    );
-
-    app.logs = logs_res?;
-    app.artifacts = artifacts_res?;
-    app.packages = packages_res?;
-    app.errors = errors_res?;
-    app.configs = configs_res?;
-
-    let (stats_res, hourly_res, daily_res, activity_res, top_errors_res, log_st_res, art_st_res) = tokio::join!(
         fetch_stats(pool),
         fetch_hourly_errors(pool),
         fetch_daily_errors(pool),
@@ -29,12 +36,6 @@ pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
         fetch_artifact_statuses(pool),
     );
 
-    app.stats = stats_res?;
-    app.error_sparkline = hourly_res?;
-    app.error_barchart = daily_res?;
-    app.activity_sparkline = activity_res?;
-    app.top_errors_barchart = top_errors_res?;
-
     let mut all_statuses: HashMap<String, u64> = HashMap::new();
     for (s, c) in log_st_res? {
         *all_statuses.entry(s).or_insert(0) += c as u64;
@@ -42,15 +43,24 @@ pub async fn refresh_all(app: &mut App, pool: &sqlx::PgPool) -> Result<()> {
     for (s, c) in art_st_res? {
         *all_statuses.entry(s).or_insert(0) += c as u64;
     }
-    app.status_counts = all_statuses.into_iter().collect();
 
-    app.last_refresh = std::time::Instant::now();
-    app.apply_filters();
-
-    Ok(())
+    Ok(RefreshData {
+        logs: logs_res?,
+        exec_errors: exec_errors_res?,
+        artifacts: artifacts_res?,
+        packages: packages_res?,
+        deploy_errors: deploy_errors_res?,
+        configs: configs_res?,
+        stats: stats_res?,
+        error_sparkline: hourly_res?,
+        error_barchart: daily_res?,
+        activity_sparkline: activity_res?,
+        top_errors_barchart: top_errors_res?,
+        status_counts: all_statuses.into_iter().collect(),
+    })
 }
 
-// ─── Requêtes individuelles ──────────────────────────────────────────────────
+// ─── Requêtes individuelles ───────────────────────────────────────────────────
 
 async fn fetch_logs(pool: &sqlx::PgPool, limit: u32) -> Result<Vec<LogView>> {
     let rows = sqlx::query_as(
@@ -60,6 +70,20 @@ async fn fetch_logs(pool: &sqlx::PgPool, limit: u32) -> Result<Vec<LogView>> {
          LIMIT $1",
     )
     .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// MPL FAILED uniquement — tableau de bord opérationnel.
+pub async fn fetch_exec_errors(pool: &sqlx::PgPool) -> Result<Vec<LogView>> {
+    let rows = sqlx::query_as(
+        "SELECT status, parsed_date, error_message, message_guid, integration_flow_name
+         FROM sap_monitoring_logs
+         WHERE status = 'FAILED'
+         ORDER BY parsed_date DESC NULLS LAST
+         LIMIT 200",
+    )
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -87,7 +111,8 @@ async fn fetch_packages(pool: &sqlx::PgPool) -> Result<Vec<PackageView>> {
     Ok(rows)
 }
 
-async fn fetch_errors(pool: &sqlx::PgPool) -> Result<Vec<ErrorView>> {
+/// Erreurs de déploiement (artifact_errors).
+async fn fetch_deploy_errors(pool: &sqlx::PgPool) -> Result<Vec<ErrorView>> {
     let rows = sqlx::query_as(
         "SELECT artifact_id, error_message, error_time
          FROM artifact_errors
@@ -172,7 +197,8 @@ async fn fetch_top_errors(pool: &sqlx::PgPool) -> Result<Vec<(String, u64)>> {
 
 async fn fetch_log_statuses(pool: &sqlx::PgPool) -> Result<Vec<(String, i64)>> {
     let rows = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM sap_monitoring_logs WHERE status IS NOT NULL GROUP BY status",
+        "SELECT status, COUNT(*) FROM sap_monitoring_logs \
+         WHERE status IS NOT NULL GROUP BY status",
     )
     .fetch_all(pool)
     .await?;
@@ -181,7 +207,8 @@ async fn fetch_log_statuses(pool: &sqlx::PgPool) -> Result<Vec<(String, i64)>> {
 
 async fn fetch_artifact_statuses(pool: &sqlx::PgPool) -> Result<Vec<(String, i64)>> {
     let rows = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM runtime_artifacts WHERE status IS NOT NULL GROUP BY status",
+        "SELECT status, COUNT(*) FROM runtime_artifacts \
+         WHERE status IS NOT NULL GROUP BY status",
     )
     .fetch_all(pool)
     .await?;

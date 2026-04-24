@@ -272,31 +272,50 @@ pub async fn fetch_all_package_artifacts(
     package_ids: &[String],
     concurrency: usize,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    use futures::stream::{self, StreamExt};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
-    let stream = stream::iter(package_ids.iter().map(|pkg_id| {
-        let client = client.clone();
-        let token = token.to_string();
-        let pkg_id = pkg_id.clone();
-        let config = config.clone();
-        async move {
-            let arts = fetch_artifacts_for_package(&client, &token, &config, &pkg_id)
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for pkg_id in package_ids {
+        let permit = sem.clone().acquire_owned().await.unwrap();
+
+        // On clone les variables pour couper tout lien de durée de vie (lifetimes)
+        let c = client.clone();
+        let t = token.to_string();
+        let p_id = pkg_id.clone();
+        let cfg = config.clone();
+
+        handles.push(tokio::spawn(async move {
+            let arts = fetch_artifacts_for_package(&c, &t, &cfg, &p_id)
                 .await
                 .unwrap_or_else(|e| {
-                    warn!("Erreur fetch package {}: {}", pkg_id, e);
+                    log::warn!("Erreur fetch package {}: {}", p_id, e);
                     vec![]
                 });
-            let ids: Vec<String> = arts.into_iter().filter_map(|a| a.id).collect();
-            (pkg_id, ids)
-        }
-    }));
 
-    stream
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect()
+            // Boucle simple au lieu de filter_map pour le compilateur
+            let mut ids = Vec::new();
+            for a in arts {
+                if let Some(id) = a.id {
+                    ids.push(id);
+                }
+            }
+
+            drop(permit);
+            (p_id, ids)
+        }));
+    }
+
+    let mut results = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok((p_id, ids)) = h.await {
+            results.insert(p_id, ids);
+        }
+    }
+
+    results
 }
 
 // ─── Configurations ──────────────────────────────────────────────────────────
