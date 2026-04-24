@@ -743,6 +743,11 @@ fn run_loop<B: ratatui::backend::Backend>(
 
                     KeyCode::Char('r') if !app.refreshing => {
                         app.refreshing = true;
+                        return Ok(AppEvent::TriggerRefresh { full: false });
+                    }
+
+                    KeyCode::Char('R') if !app.refreshing => {
+                        app.refreshing = true;
                         return Ok(AppEvent::TriggerRefresh { full: true });
                     }
 

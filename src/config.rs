@@ -44,9 +44,9 @@ impl SapConfig {
 
     pub fn logs_url(&self, top: u32, filter: Option<&str>) -> String {
         let mut url = format!(
-            "{}/api/v1/MessageProcessingLogs?$orderby=LogStart desc&$top={}",
-            self.base_url, top
-        );
+                "{}/api/v1/MessageProcessingLogs?$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart desc&$top={}",
+                self.base_url, top
+            );
         if let Some(f) = filter {
             url.push_str(&format!("&$filter={}", f));
         }
@@ -115,10 +115,14 @@ impl TokenCache {
 
 // ─── Configuration utilisateur persistée ────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserConfig {
     pub logs_limit: u32,
     pub parallel_requests: usize,
+    #[serde(default)]
+    pub cached_token: Option<String>,
+    #[serde(default)]
+    pub cached_token_expires_at: Option<u64>,
 }
 
 impl Default for UserConfig {
@@ -126,6 +130,8 @@ impl Default for UserConfig {
         Self {
             logs_limit: 200,
             parallel_requests: 20,
+            cached_token: None,
+            cached_token_expires_at: None,
         }
     }
 }

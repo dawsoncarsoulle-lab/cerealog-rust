@@ -1,4 +1,4 @@
-use crate::config::{SapConfig, TokenCache};
+use crate::config::{SapConfig, TokenCache, UserConfig};
 use crate::models::{DesigntimeArtifact, ODataDesignResponse};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime};
@@ -34,10 +34,11 @@ fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
 
 // ─── HTTP client ─────────────────────────────────────────────────────────────
 
-/// Construit un client HTTP réutilisable avec connection pooling.
+/// Construit un client HTTP réutilisable avec connection pooling optimisé.
 pub fn build_http_client() -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(50)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()?;
     Ok(client)
@@ -62,7 +63,41 @@ pub async fn get_sap_token(client: &reqwest::Client, config: &SapConfig) -> Resu
     Ok(TokenCache::new(token_data.access_token, 3500))
 }
 
-/// Renouvelle le token s'il est expiré, sinon le retourne tel quel.
+pub async fn get_or_refresh_token(
+    client: &reqwest::Client,
+    config: &SapConfig,
+    user_config: &mut UserConfig,
+) -> Result<TokenCache> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Token disque valide (marge 120s) ?
+    if let (Some(tok), Some(exp)) = (
+        &user_config.cached_token,
+        user_config.cached_token_expires_at,
+    ) {
+        if exp > now + 120 {
+            log::info!(
+                "Token OAuth lu depuis le cache disque (expire dans {}s)",
+                exp - now
+            );
+            let ttl = exp - now;
+            return Ok(TokenCache::new(tok.clone(), ttl));
+        }
+    }
+
+    // Sinon, fetch OAuth normal
+    let cache = get_sap_token(client, config).await?;
+    let expires_at = now + 3500;
+    user_config.cached_token = Some(cache.get().to_string());
+    user_config.cached_token_expires_at = Some(expires_at);
+    user_config.save(); // Sauvegarde sur disque
+    Ok(cache)
+}
+
+/// Renouvelle le token s'il est expiré en cours d'exécution.
 pub async fn ensure_valid_token(
     client: &reqwest::Client,
     config: &SapConfig,
@@ -281,7 +316,6 @@ pub async fn fetch_all_package_artifacts(
     for pkg_id in package_ids {
         let permit = sem.clone().acquire_owned().await.unwrap();
 
-        // On clone les variables pour couper tout lien de durée de vie (lifetimes)
         let c = client.clone();
         let t = token.to_string();
         let p_id = pkg_id.clone();
@@ -295,7 +329,6 @@ pub async fn fetch_all_package_artifacts(
                     vec![]
                 });
 
-            // Boucle simple au lieu de filter_map pour le compilateur
             let mut ids = Vec::new();
             for a in arts {
                 if let Some(id) = a.id {

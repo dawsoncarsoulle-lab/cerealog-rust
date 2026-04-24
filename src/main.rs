@@ -193,8 +193,6 @@ async fn run_fetch_worker(
     incremental: bool,
     tx: mpsc::Sender<RefreshData>,
 ) {
-    // 💡 Astuce : Cette fonction locale garantit qu'on prévient toujours l'UI
-    // de la fin du processus, même si le réseau plante, pour stopper le spinner.
     let send_fallback = |tx: mpsc::Sender<RefreshData>, pool: sqlx::PgPool| async move {
         let data = queries::build_refresh_data(&pool, top)
             .await
@@ -215,6 +213,9 @@ async fn run_fetch_worker(
         let _ = tx.send(data).await;
     };
 
+    // Chargement indépendant de la config utilisateur pour éviter les conflits mémoires
+    let mut u_config = UserConfig::load();
+
     let client = match api::build_http_client() {
         Ok(c) => c,
         Err(e) => {
@@ -224,7 +225,8 @@ async fn run_fetch_worker(
         }
     };
 
-    let mut token_cache = match api::get_sap_token(&client, &sap_config).await {
+    let mut token_cache = match api::get_or_refresh_token(&client, &sap_config, &mut u_config).await
+    {
         Ok(t) => t,
         Err(e) => {
             log::error!("Auth worker: {}", e);
@@ -238,25 +240,36 @@ async fn run_fetch_worker(
         send_fallback(tx, pool).await;
         return;
     }
-    let token = token_cache.get().to_string();
-    let concurrency = 20usize;
 
-    // Étape 1 : Logs
-    if let Err(e) = sync_logs(
-        client.clone(),
-        token.clone(),
-        sap_config.clone(),
-        pool.clone(),
-        top,
-        incremental,
-        concurrency,
-    )
-    .await
-    {
+    let token = token_cache.get().to_string();
+    let log_concurrency = 50usize; // Optimisation pour les MessageProcessingLogs FAILED (I/O pur)
+    let concurrency = 20usize; // Concurrence classique pour le reste
+
+    // ── Étapes 1 + 2 en parallèle : Logs ET Packages/Artifacts ──────────────
+    let (logs_res, packages_res) = tokio::join!(
+        sync_logs(
+            client.clone(),
+            token.clone(),
+            sap_config.clone(),
+            pool.clone(),
+            top,
+            incremental,
+            log_concurrency,
+        ),
+        sync_packages_and_artifacts(
+            client.clone(),
+            token.clone(),
+            sap_config.clone(),
+            pool.clone(),
+            concurrency,
+        )
+    );
+
+    if let Err(e) = logs_res {
         log::error!("sync_logs échoué: {}", e);
     }
 
-    // Pending alerts exec
+    // Pending alerts exec — après que les logs soient écrits en base.
     if let Ok(failed) = queries::fetch_exec_errors(&pool).await {
         for l in &failed {
             if let (Some(guid), Some(flow)) = (&l.message_guid, &l.integration_flow_name) {
@@ -272,16 +285,7 @@ async fn run_fetch_worker(
         }
     }
 
-    // Étape 2 : Packages + Artifacts
-    let pkg_ids = match sync_packages_and_artifacts(
-        client.clone(),
-        token.clone(),
-        sap_config.clone(),
-        pool.clone(),
-        concurrency,
-    )
-    .await
-    {
+    let pkg_ids = match packages_res {
         Ok(ids) => ids,
         Err(e) => {
             log::error!("sync_packages échoué: {}", e);
@@ -289,7 +293,7 @@ async fn run_fetch_worker(
         }
     };
 
-    // Étape 3 : Configurations
+    // Étape 3 : Configurations (dépend de pkg_ids → reste séquentielle)
     if !pkg_ids.is_empty() {
         if let Err(e) = sync_configurations(
             client.clone(),
@@ -373,9 +377,6 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let event = ui::run_tui(&mut app, &mut rx)?;
 
-        // ✅ CRITIQUE : Plus de vérifications 'if !app.refreshing' ici.
-        // L'interface (ui.rs) gère déjà l'état et prévient les lancements en double.
-        // Quand main.rs reçoit un événement, il l'exécute, point final.
         match event {
             AppEvent::Quit => {
                 app.user_config.logs_limit = app.logs_limit;
