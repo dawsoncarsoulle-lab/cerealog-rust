@@ -145,3 +145,43 @@ pub struct ODataConfigResponse {
 pub struct ODataConfigData {
     pub results: Vec<ArtifactConfiguration>,
 }
+
+// ─── Statistiques globales ───────────────────────────────────────────────────
+
+pub struct Stats {
+    pub total_logs: i64,
+    pub failed_logs: i64,
+    pub total_packages: i64,
+    pub total_artifacts: i64,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            total_logs: 0,
+            failed_logs: 0,
+            total_packages: 0,
+            total_artifacts: 0,
+        }
+    }
+}
+
+// ─── Payload envoyé via le channel async worker → UI ────────────────────────
+
+use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
+use std::collections::HashMap;
+
+pub struct RefreshData {
+    pub logs: Vec<LogView>,
+    pub exec_errors: Vec<LogView>,
+    pub artifacts: Vec<ArtifactView>,
+    pub packages: Vec<PackageView>,
+    pub deploy_errors: Vec<ErrorView>,
+    pub configs: HashMap<String, Vec<(String, String)>>,
+    pub stats: Stats,
+    pub error_sparkline: Vec<u64>,
+    pub error_barchart: Vec<(String, u64)>,
+    pub activity_sparkline: Vec<u64>,
+    pub top_errors_barchart: Vec<(String, u64)>,
+    pub status_counts: Vec<(String, u64)>,
+}

@@ -1,4 +1,4 @@
-use crate::config::{SapConfig, TokenCache};
+use crate::config::{SapConfig, TokenCache, UserConfig};
 use crate::models::{DesigntimeArtifact, ODataDesignResponse};
 use anyhow::Result;
 use chrono::{DateTime, NaiveDateTime};
@@ -34,10 +34,11 @@ fn clean_sap_date(raw_date: Option<&str>) -> Option<NaiveDateTime> {
 
 // ─── HTTP client ─────────────────────────────────────────────────────────────
 
-/// Construit un client HTTP réutilisable avec connection pooling.
+/// Construit un client HTTP réutilisable avec connection pooling optimisé.
 pub fn build_http_client() -> Result<reqwest::Client> {
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(50)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
         .tcp_keepalive(std::time::Duration::from_secs(60))
         .build()?;
     Ok(client)
@@ -58,11 +59,42 @@ pub async fn get_sap_token(client: &reqwest::Client, config: &SapConfig) -> Resu
     let token_data: TokenResponse = token_res.json().await?;
     info!("Jeton obtenu !");
 
-    // TTL par défaut de 3600s (1h), on renouvelle 60s avant
     Ok(TokenCache::new(token_data.access_token, 3500))
 }
 
-/// Renouvelle le token s'il est expiré, sinon le retourne tel quel.
+pub async fn get_or_refresh_token(
+    client: &reqwest::Client,
+    config: &SapConfig,
+    user_config: &mut UserConfig,
+) -> Result<TokenCache> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let (Some(tok), Some(exp)) = (
+        &user_config.cached_token,
+        user_config.cached_token_expires_at,
+    ) {
+        if exp > now + 120 {
+            log::info!(
+                "Token OAuth lu depuis le cache disque (expire dans {}s)",
+                exp - now
+            );
+            let ttl = exp - now;
+            return Ok(TokenCache::new(tok.clone(), ttl));
+        }
+    }
+
+    let cache = get_sap_token(client, config).await?;
+    let expires_at = now + 3500;
+    user_config.cached_token = Some(cache.get().to_string());
+    user_config.cached_token_expires_at = Some(expires_at);
+    user_config.save();
+    Ok(cache)
+}
+
+/// Renouvelle le token s'il est expiré en cours d'exécution.
 pub async fn ensure_valid_token(
     client: &reqwest::Client,
     config: &SapConfig,
@@ -272,31 +304,48 @@ pub async fn fetch_all_package_artifacts(
     package_ids: &[String],
     concurrency: usize,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    use futures::stream::{self, StreamExt};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
-    let stream = stream::iter(package_ids.iter().map(|pkg_id| {
-        let client = client.clone();
-        let token = token.to_string();
-        let pkg_id = pkg_id.clone();
-        let config = config.clone();
-        async move {
-            let arts = fetch_artifacts_for_package(&client, &token, &config, &pkg_id)
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+
+    for pkg_id in package_ids {
+        let permit = sem.clone().acquire_owned().await.unwrap();
+
+        let c = client.clone();
+        let t = token.to_string();
+        let p_id = pkg_id.clone();
+        let cfg = config.clone();
+
+        handles.push(tokio::spawn(async move {
+            let arts = fetch_artifacts_for_package(&c, &t, &cfg, &p_id)
                 .await
                 .unwrap_or_else(|e| {
-                    warn!("Erreur fetch package {}: {}", pkg_id, e);
+                    log::warn!("Erreur fetch package {}: {}", p_id, e);
                     vec![]
                 });
-            let ids: Vec<String> = arts.into_iter().filter_map(|a| a.id).collect();
-            (pkg_id, ids)
-        }
-    }));
 
-    stream
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect()
+            let mut ids = Vec::new();
+            for a in arts {
+                if let Some(id) = a.id {
+                    ids.push(id);
+                }
+            }
+
+            drop(permit);
+            (p_id, ids)
+        }));
+    }
+
+    let mut results = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok((p_id, ids)) = h.await {
+            results.insert(p_id, ids);
+        }
+    }
+
+    results
 }
 
 // ─── Configurations ──────────────────────────────────────────────────────────

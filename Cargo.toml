@@ -1,6 +1,6 @@
 [package]
 name = "sap-extractor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -12,7 +12,7 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = "0.10"
 dotenvy = "0.15"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
 regex = "1.10"
 sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono"] }
 clap = { version = "4.4", features = ["derive"] }

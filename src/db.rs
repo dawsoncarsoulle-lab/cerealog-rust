@@ -145,7 +145,6 @@ pub async fn insert_artifact_error(pool: &sqlx::PgPool, error: ArtifactError) ->
     Ok(())
 }
 
-/// Mise à jour batch des package_id via UNNEST — remplace le N+1 transactionnel.
 pub async fn bulk_update_artifact_package(
     pool: &sqlx::PgPool,
     mappings: &[(String, String)],
@@ -240,4 +239,80 @@ pub async fn get_latest_log_date(pool: &sqlx::PgPool) -> Result<Option<chrono::N
             .fetch_optional(pool)
             .await?;
     Ok(row.and_then(|(d,)| d))
+}
+
+// ─── Pending Alerts (Webhook debouncing) ─────────────────────────────────────
+
+/// Insère une alerte en attente. `error_type` = "exec" ou "deploy".
+pub async fn insert_pending_alert(
+    pool: &sqlx::PgPool,
+    log_guid: &str,
+    flow_name: &str,
+    error_type: &str,
+    error_snippet: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO pending_alerts (log_guid, flow_name, error_type, error_snippet, detected_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (log_guid) DO NOTHING",
+    )
+    .bind(log_guid)
+    .bind(flow_name)
+    .bind(error_type)
+    .bind(error_snippet)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct PendingAlert {
+    pub id: i64,
+    pub log_guid: String,
+    pub flow_name: String,
+    pub error_type: String,
+    pub error_snippet: String,
+    pub detected_at: chrono::NaiveDateTime,
+}
+
+/// Lit toutes les alertes en attente, regroupées.
+pub async fn fetch_pending_alerts(pool: &sqlx::PgPool) -> Result<Vec<PendingAlert>> {
+    let rows = sqlx::query_as::<_, PendingAlert>(
+        "SELECT id, log_guid, flow_name, error_type, error_snippet, detected_at
+         FROM pending_alerts
+         ORDER BY detected_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Supprime les alertes envoyées par leurs IDs.
+pub async fn delete_pending_alerts(pool: &sqlx::PgPool, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM pending_alerts WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// DDL pour créer la table pending_alerts si elle n'existe pas.
+pub async fn ensure_pending_alerts_table(pool: &sqlx::PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_alerts (
+            id           BIGSERIAL PRIMARY KEY,
+            log_guid     TEXT NOT NULL,
+            flow_name    TEXT NOT NULL DEFAULT '',
+            error_type   TEXT NOT NULL DEFAULT 'exec',
+            error_snippet TEXT NOT NULL DEFAULT '',
+            detected_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+            CONSTRAINT pending_alerts_guid_uq UNIQUE (log_guid)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
