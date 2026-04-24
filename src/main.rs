@@ -232,6 +232,50 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.contains(&"--daemon".to_string()) {
+        println!("🚀 Mode Démon activé : Test de performance en cours...");
+
+        let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
+        let sap_config = SapConfig::from_env()?;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&db_url)
+            .await?;
+
+        let client = api::build_http_client()?;
+        let mut token_cache = api::get_sap_token(&client, &sap_config).await?;
+
+        // On cherche si on a passé l'argument --top (ex: --top 500)
+        let mut top = 500; // Valeur par défaut
+        if let Some(pos) = args.iter().position(|a| a == "--top") {
+            if let Some(val) = args.get(pos + 1) {
+                if let Ok(parsed_top) = val.parse::<u32>() {
+                    top = parsed_top;
+                }
+            }
+        }
+
+        // ✅ MATCH ÉQUITABLE : On extrait et insère UNIQUEMENT les logs, comme le script Python
+        println!("⏬ Téléchargement et insertion de {} logs...", top);
+        sync_logs(
+            &client,
+            token_cache.get(),
+            &sap_config,
+            &pool,
+            top,
+            false,
+            20,
+        )
+        .await?;
+
+        println!("✅ Extraction terminée.");
+        return Ok(());
+    }
+    // -------------------------------------------------------------------
+
+    // Le reste de ton programme normal (TUI)
     let cli = Cli::parse();
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
@@ -289,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Boucle principale ─────────────────────────────────────────────────────
-    const AUTO_REFRESH: Duration = Duration::from_secs(300);
+    const AUTO_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
 
     loop {
         let event = ui::run_tui(&mut app)?;
