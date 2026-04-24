@@ -2125,8 +2125,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ("d", "calendrier"),
         ("D", "effacer date"),
         ("+", "500 logs"),
-        ("r", "refresh"),
+        ("r", "refresh-logs"),
         ("q", "quitter"),
+        ("R", "full-refresh"),
     ];
     for (key, action) in shortcuts {
         spans.push(Span::styled(

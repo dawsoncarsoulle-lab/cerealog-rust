@@ -147,7 +147,6 @@ pub struct ODataConfigData {
 }
 
 // ─── Statistiques globales ───────────────────────────────────────────────────
-// Défini ici (pas dans ui.rs) pour éviter les dépendances circulaires.
 
 pub struct Stats {
     pub total_logs: i64,

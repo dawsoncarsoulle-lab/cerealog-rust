@@ -4,7 +4,6 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 /// Construit le payload complet de rafraîchissement.
-/// Appelé par le worker en arrière-plan, jamais par le thread UI.
 pub async fn build_refresh_data(pool: &sqlx::PgPool, logs_limit: u32) -> Result<RefreshData> {
     let (
         logs_res,

@@ -145,7 +145,6 @@ pub async fn insert_artifact_error(pool: &sqlx::PgPool, error: ArtifactError) ->
     Ok(())
 }
 
-/// Mise à jour batch des package_id via UNNEST.
 pub async fn bulk_update_artifact_package(
     pool: &sqlx::PgPool,
     mappings: &[(String, String)],

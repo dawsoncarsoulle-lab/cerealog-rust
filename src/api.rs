@@ -59,7 +59,6 @@ pub async fn get_sap_token(client: &reqwest::Client, config: &SapConfig) -> Resu
     let token_data: TokenResponse = token_res.json().await?;
     info!("Jeton obtenu !");
 
-    // TTL par défaut de 3600s (1h), on renouvelle 60s avant
     Ok(TokenCache::new(token_data.access_token, 3500))
 }
 
@@ -73,7 +72,6 @@ pub async fn get_or_refresh_token(
         .unwrap_or_default()
         .as_secs();
 
-    // Token disque valide (marge 120s) ?
     if let (Some(tok), Some(exp)) = (
         &user_config.cached_token,
         user_config.cached_token_expires_at,
@@ -88,12 +86,11 @@ pub async fn get_or_refresh_token(
         }
     }
 
-    // Sinon, fetch OAuth normal
     let cache = get_sap_token(client, config).await?;
     let expires_at = now + 3500;
     user_config.cached_token = Some(cache.get().to_string());
     user_config.cached_token_expires_at = Some(expires_at);
-    user_config.save(); // Sauvegarde sur disque
+    user_config.save();
     Ok(cache)
 }
 

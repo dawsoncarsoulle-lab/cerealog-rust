@@ -1,161 +1,101 @@
-C'est une excellente décision ! Passer sur Apache Airflow, c'est littéralement entrer dans la cour des grands pour l'ingénierie de la donnée. Les deux documentations que tu as (l'officielle et le blog de Stéphane Robert) sont d'excellentes références.
+import asyncio
+import aiohttp
+import time
+import os
+from dotenv import load_dotenv
 
-Pour t'éviter de te perdre dans les dizaines d'options d'installation, voici le guide **le plus direct et le plus propre** pour installer Airflow sur ton WSL spécialement pour le développement local de ton projet SAP.
+# Charger les variables d'environnement
 
-Nous allons utiliser l'installation standard via **Python (pip)** avec un environnement virtuel. C'est la méthode la plus légère pour coder et tester tes DAGs rapidement avant de penser à Docker.
+load_dotenv()
 
-Voici ta feuille de route exacte :
+BASE_URL = os.getenv("SAP_BASE_URL")
+TOKEN_URL = os.getenv("SAP_TOKEN_URL")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+TOP = 500 # On s'aligne sur ton benchmark de 500 logs
+CONCURRENCY = 20
 
-### 🛠️ Étape 1 : Préparer ton système WSL
+async def get_token(session):
+auth = aiohttp.BasicAuth(CLIENT_ID, CLIENT_SECRET)
+async with session.post(TOKEN_URL, auth=auth) as response:
+response.raise_for_status()
+data = await response.json()
+return data["access_token"]
 
-Airflow est un gros logiciel Python. Il faut s'assurer que ton Ubuntu/Pop!\_OS a les bons outils. Ouvre ton terminal et tape :
+async def fetch_odata(session, token, url):
+headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+async with session.get(url, headers=headers) as response:
+if response.status == 200:
+data = await response.json()
+return data.get("d", {}).get("results", [])
+return []
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-pip python3-venv libpq-dev
-```
+async def fetch_configs(session, token, package_ids):
+"""Récupère les configurations de manière concurrente avec un Sémaphore"""
+sem = asyncio.Semaphore(CONCURRENCY)
 
-### 📦 Étape 2 : Créer ton espace de travail
+    async def fetch_single_package(pkg_id):
+        async with sem:
+            url = f"{BASE_URL}/api/v1/IntegrationPackages('{pkg_id}')/IntegrationDesigntimeArtifacts"
+            return await fetch_odata(session, token, url)
 
-On ne va pas installer Airflow "en vrac" sur ton PC. On va créer un dossier dédié et un environnement virtuel (pour isoler les paquets Python).
+    # Récupérer les artifacts des packages
+    tasks = [fetch_single_package(pid) for pid in package_ids]
+    results = await asyncio.gather(*tasks)
 
-```bash
-# 1. Créer un dossier pour ton nouveau projet
-mkdir ~/airflow-sap
-cd ~/airflow-sap
+    # Extraire tous les IDs d'artifacts
+    all_art_ids = [art["Id"] for pkg_arts in results for art in pkg_arts if "Id" in art]
 
-# 2. Créer l'environnement virtuel Python
-python3 -m venv venv
+    async def fetch_single_config(art_id):
+        async with sem:
+            url = f"{BASE_URL}/api/v1/IntegrationDesigntimeArtifacts(Id='{art_id}',Version='active')/Configurations"
+            return await fetch_odata(session, token, url)
 
-# 3. L'activer (à faire à chaque fois que tu ouvres un nouveau terminal !)
-source venv/bin/activate
-```
+    # Récupérer les configs
+    config_tasks = [fetch_single_config(aid) for aid in all_art_ids]
+    await asyncio.gather(*config_tasks)
 
-_(Ton terminal devrait maintenant afficher `(venv)` au début de la ligne)._
+async def main():
+print("🚀 Démarrage du benchmark Python Asynchrone (aiohttp)...")
+start_time = time.perf_counter()
 
-### ⬇️ Étape 3 : L'installation d'Airflow (La méthode officielle)
+    # Configuration du pool TCP (équivalent au pool_max_idle_per_host de reqwest)
+    connector = aiohttp.TCPConnector(limit_per_host=50)
 
-Airflow est très capricieux avec les versions de ses dépendances. La documentation officielle recommande d'utiliser un fichier de "contraintes" pour éviter que l'installation ne plante.
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # 1. Auth
+        token = await get_token(session)
+        auth_time = time.perf_counter()
+        print(f"🔑 Token OAuth obtenu en {auth_time - start_time:.3f}s")
 
-Copie-colle ce bloc entier dans ton terminal (cela va détecter ta version de Python et installer la version stable d'Airflow) :
+        # URLs optimisées avec $select (pour être à armes égales avec Rust)
+        logs_url = f"{BASE_URL}/api/v1/MessageProcessingLogs?$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart desc&$top={TOP}"
+        packages_url = f"{BASE_URL}/api/v1/IntegrationPackages" # Sans select comme vu précédemment
+        artifacts_url = f"{BASE_URL}/api/v1/IntegrationRuntimeArtifacts" # Sans select
 
-```bash
-# Définir le dossier où Airflow va stocker sa base de données locale et tes DAGs
-export AIRFLOW_HOME=~/airflow-sap/airflow
+        # 2. Parallélisation Logs, Packages et Artifacts (L'équivalent du tokio::join!)
+        logs_task = fetch_odata(session, token, logs_url)
+        packages_task = fetch_odata(session, token, packages_url)
+        artifacts_task = fetch_odata(session, token, artifacts_url)
 
-# Récupérer la version d'Airflow et de ton Python
-AIRFLOW_VERSION=2.9.1
-PYTHON_VERSION="$(python --version | cut -d " " -f 2 | cut -d "." -f 1-2)"
+        logs, packages, artifacts = await asyncio.gather(logs_task, packages_task, artifacts_task)
 
-# URL du fichier de contraintes officiel d'Apache
-CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+        # 3. Configurations séquentielles (dépendantes des packages)
+        package_ids = [p["Id"] for p in packages if "Id" in p]
+        await fetch_configs(session, token, package_ids)
 
-# Installation magique
-pip install "apache-airflow==${AIRFLOW_VERSION}" --constraint "${CONSTRAINT_URL}"
-```
+    end_time = time.perf_counter()
 
-_(Laisse tourner, ça peut prendre 1 à 2 minutes)._
+    print("\n" + "="*50)
+    print(f"📊 RÉSULTATS DU BENCHMARK PYTHON")
+    print("="*50)
+    print(f"📦 Logs extraits      : {len(logs)}")
+    print(f"📦 Packages extraits  : {len(packages)}")
+    print(f"📦 Artifacts extraits : {len(artifacts)}")
+    print(f"⏱️  TEMPS TOTAL        : {end_time - start_time:.3f} secondes")
+    print("="*50)
 
-### 🚀 Étape 4 : Le lancement magique (`standalone`)
-
-Pour le développement local, Airflow a créé une commande géniale qui initialise la base de données (SQLite par défaut), crée un utilisateur et lance tous les services d'un coup.
-
-```bash
-airflow standalone
-```
-
-**⚠️ ATTENTION : Regarde bien ce qui s'affiche dans ton terminal !**
-Au milieu des logs, Airflow va générer un mot de passe aléatoire pour le compte `admin`. Cherche une ligne qui ressemble à ça et **copie le mot de passe** :
-`admin | <ton-mot-de-passe-généré>`
-
-### 🌐 Étape 5 : Connecte-toi à l'interface !
-
-1. Ouvre ton navigateur web (sur ton Windows).
-2. Va à l'adresse : **`http://localhost:8080`**
-3. Connecte-toi avec l'identifiant `admin` et le mot de passe que tu viens de copier.
-
-Bienvenue dans Apache Airflow ! Tu verras plein de "DAGs" d'exemples pré-installés.
-
----
-
-### 🐍 Étape 6 : Préparer ton premier DAG SAP BTP
-
-Maintenant que le moteur tourne, il faut lui donner ton code.
-Laisse le terminal avec `airflow standalone` tourner, et **ouvre un nouveau terminal WSL**.
-
-```bash
-# 1. Retourne dans ton dossier et active l'environnement
-cd ~/airflow-sap
-source venv/bin/activate
-export AIRFLOW_HOME=~/airflow-sap/airflow
-
-# 2. Crée le dossier où Airflow ira lire tes scripts Python
-mkdir -p $AIRFLOW_HOME/dags
-
-# 3. Crée ton premier fichier DAG
-touch $AIRFLOW_HOME/dags/sap_extractor_dag.py
-```
-
-Ouvre ce fichier `sap_extractor_dag.py` dans VSCode, et voici le squelette de base que tu vas devoir remplir pour reproduire ce que tu as fait en Rust :
-
-```python
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from datetime import datetime, timedelta
-
-# 1. Définition des paramètres par défaut
-default_args = {
-    'owner': 'dawson',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=1),
-}
-
-# 2. Création du DAG (planification)
-# Ici, il se lancera toutes les 5 minutes (*/5 * * * *)
-with DAG(
-    'sap_btp_monitoring_sync',
-    default_args=default_args,
-    description='Rapatriement des logs SAP BTP B2B',
-    schedule_interval='*/5 * * * *',
-    start_date=datetime(2023, 1, 1),
-    catchup=False,
-    tags=['sap', 'monitoring'],
-) as dag:
-
-    # 3. Tes fonctions Python (La logique métier)
-    def fetch_sap_token():
-        print("Récupération du token OAuth2...")
-        # TODO: Ton code Python avec la librairie 'requests'
-
-    def fetch_and_insert_logs():
-        print("Extraction des logs et insertion en DB...")
-        # TODO: Appels API SAP OData et insertion (avec 'psycopg2' ou 'SQLAlchemy')
-
-    def send_teams_alert():
-        print("Vérification des erreurs et envoi du Webhook...")
-        # TODO: Envoyer le payload JSON si erreur
-
-    # 4. Les "Tâches" (Tasks)
-    task_get_token = PythonOperator(
-        task_id='get_oauth_token',
-        python_callable=fetch_sap_token,
-    )
-
-    task_extract_logs = PythonOperator(
-        task_id='extract_and_insert_logs',
-        python_callable=fetch_and_insert_logs,
-    )
-
-    task_alerting = PythonOperator(
-        task_id='send_alerts',
-        python_callable=send_teams_alert,
-    )
-
-    # 5. L'ordre d'exécution (Le Graphe / DAG)
-    task_get_token >> task_extract_logs >> task_alerting
-```
-
-Dès que tu sauvegarderas ce fichier, si tu rafraîchis la page web d'Airflow (`localhost:8080`), ton DAG `sap_btp_monitoring_sync` apparaîtra dans la liste ! Tu pourras cliquer sur "Play" pour le lancer manuellement et voir chaque tâche passer au vert.
+if **name** == "**main**": # Optimisation asyncio pour Windows/Linux
+if os.name == 'nt':
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
