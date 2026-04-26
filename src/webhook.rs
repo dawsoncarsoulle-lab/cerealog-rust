@@ -7,7 +7,11 @@
 //!   4. POST vers `WEBHOOK_URL` (env var)
 //!   5. Supprimer les lignes envoyées
 
-use crate::db::{delete_pending_alerts, fetch_pending_alerts, PendingAlert};
+use crate::db::{
+    delete_pending_alerts, fetch_pending_alerts, fetch_pending_smart_alerts,
+    mark_smart_alerts_sent, upsert_smart_alert, PendingAlert, SmartAlert,
+};
+use crate::queries::{detect_persistent_failure, detect_regression, detect_spike};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -83,6 +87,185 @@ pub async fn process_pending_alerts(pool: &sqlx::PgPool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─── Traitement des alertes intelligentes ──────────────────────────────────
+
+/// Ce worker détecte les pics, régressions et pannes persistantes, met à jour
+/// la table `smart_alerts` puis envoie les alertes pendantes via Teams. Les
+/// alertes sont regroupées par type pour éviter de spammer et fournir un
+/// résumé clair.
+pub async fn process_smart_alerts(pool: &sqlx::PgPool) -> Result<()> {
+    // Détecter les situations d'alerte et mettre à jour la table smart_alerts.
+    // Spike d'erreurs
+    let spikes = detect_spike(pool).await?;
+    for (tenant_id, flow_name, recent_count, avg_count) in spikes {
+        let extra = serde_json::json!({
+            "recent_count": recent_count,
+            "avg_count": avg_count
+        });
+        upsert_smart_alert(pool, &tenant_id, &flow_name, "SPIKE", Some(extra)).await?;
+    }
+    // Régressions
+    let regressions = detect_regression(pool).await?;
+    for (tenant_id, flow_name) in regressions {
+        upsert_smart_alert(pool, &tenant_id, &flow_name, "REGRESSION", None).await?;
+    }
+    // Pannes persistantes
+    let persistents = detect_persistent_failure(pool).await?;
+    for (tenant_id, flow_name, mins) in persistents {
+        let extra = serde_json::json!({
+            "duration_mins": mins
+        });
+        upsert_smart_alert(pool, &tenant_id, &flow_name, "PERSISTENT", Some(extra)).await?;
+    }
+
+    // Récupérer toutes les alertes intelligentes en attente
+    let alerts = fetch_pending_smart_alerts(pool).await?;
+    if alerts.is_empty() {
+        return Ok(());
+    }
+    log::info!(
+        "{} alertes intelligentes en attente à traiter.",
+        alerts.len()
+    );
+
+    // Regrouper par type d'alerte pour envoyer un message par type
+    let mut groups: HashMap<String, Vec<SmartAlert>> = HashMap::new();
+    for alert in alerts {
+        groups
+            .entry(alert.alert_type.clone())
+            .or_default()
+            .push(alert);
+    }
+
+    let webhook_url = match std::env::var("WEBHOOK_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            log::debug!("WEBHOOK_URL non définie — webhook désactivé.");
+            return Ok(());
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut sent_ids: Vec<i64> = Vec::new();
+    for (alert_type, group) in &groups {
+        let card = build_smart_card(alert_type, group);
+        match client
+            .post(&webhook_url)
+            .header("Content-Type", "application/json")
+            .body(card)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                log::info!(
+                    "✓ Webhook envoyé (smart) : type='{}' ({} item(s))",
+                    alert_type,
+                    group.len()
+                );
+                sent_ids.extend(group.iter().map(|a| a.id));
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "Webhook HTTP {} pour type='{}': {:?}",
+                    resp.status(),
+                    alert_type,
+                    resp.text().await.unwrap_or_default()
+                );
+            }
+            Err(e) => {
+                log::warn!("Webhook réseau échoué pour type='{}': {}", alert_type, e);
+            }
+        }
+    }
+
+    // Mettre à jour les alertes envoyées
+    if !sent_ids.is_empty() {
+        mark_smart_alerts_sent(pool, &sent_ids).await?;
+        log::info!(
+            "{} alertes intelligentes mises à jour comme envoyées.",
+            sent_ids.len()
+        );
+    }
+    Ok(())
+}
+
+// ─── Construction de la Teams Adaptive Card pour alertes intelligentes ───────
+
+fn build_smart_card(alert_type: &str, group: &[SmartAlert]) -> String {
+    // Détermination du titre et du thème en fonction du type
+    let (icon, title, color) = match alert_type {
+        "SPIKE" => ("📈", "Spike d'erreurs", "FFA500"),
+        "REGRESSION" => ("🔁", "Régression de flux", "FF9900"),
+        "PERSISTENT" => ("🛑", "Panne persistante", "CC0000"),
+        _ => ("ℹ️", "Alerte", "0078D4"),
+    };
+
+    // Construire la liste des flux concernés avec infos supplémentaires
+    let mut lines: Vec<String> = Vec::new();
+    for alert in group {
+        let mut line = format!("• {}", alert.flow_name);
+        if let Some(ref extra) = alert.extra {
+            if let Some(obj) = extra.as_object() {
+                if alert.alert_type == "SPIKE" {
+                    if let (Some(recent), Some(avg)) =
+                        (obj.get("recent_count"), obj.get("avg_count"))
+                    {
+                        line.push_str(&format!(" — {} erreurs (moy. {:.1})", recent, avg));
+                    }
+                } else if alert.alert_type == "PERSISTENT" {
+                    if let Some(dur) = obj.get("duration_mins") {
+                        line.push_str(&format!(" — depuis {} min", dur));
+                    }
+                }
+            }
+        }
+        lines.push(line);
+    }
+    let flows_section = lines.join("\\n");
+
+    // Titre synthétique indiquant le nombre de flux
+    let subtitle = match alert_type {
+        "SPIKE" => format!("{} flux en forte augmentation", group.len()),
+        "REGRESSION" => format!("{} flux en échec après succès", group.len()),
+        "PERSISTENT" => format!("{} flux en échec prolongé", group.len()),
+        _ => format!("{} alertes", group.len()),
+    };
+
+    serde_json::json!({
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": color,
+        "summary": format!("{} {} — {}", icon, title, subtitle),
+        "sections": [
+            {
+                "activityTitle": format!("{} **{}**", icon, title),
+                "activitySubtitle": subtitle,
+                "facts": [
+                    { "name": "Nombre de flux", "value": group.len().to_string() }
+                ],
+                "markdown": true
+            },
+            {
+                "title": "Flux concernés",
+                "text": flows_section
+            }
+        ],
+        "potentialAction": [
+            {
+                "@type": "OpenUri",
+                "name": "Ouvrir SAP BTP",
+                "targets": [
+                    { "os": "default", "uri": std::env::var("SAP_BASE_URL").unwrap_or_else(|_| "https://cockpit.btp.cloud.sap".to_string()) }
+                ]
+            }
+        ]
+    })
+    .to_string()
 }
 
 // ─── Construction de la Teams Adaptive Card ───────────────────────────────────

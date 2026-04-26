@@ -148,6 +148,7 @@ pub struct ODataConfigData {
 
 // ─── Statistiques globales ───────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct Stats {
     pub total_logs: i64,
     pub failed_logs: i64,
@@ -155,16 +156,16 @@ pub struct Stats {
     pub total_artifacts: i64,
 }
 
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            total_logs: 0,
-            failed_logs: 0,
-            total_packages: 0,
-            total_artifacts: 0,
-        }
-    }
-}
+// impl Default for Stats {
+//     fn default() -> Self {
+//         Self {
+//             total_logs: 0,
+//             failed_logs: 0,
+//             total_packages: 0,
+//             total_artifacts: 0,
+//         }
+//     }
+// }
 
 // ─── Payload envoyé via le channel async worker → UI ────────────────────────
 
@@ -174,6 +175,7 @@ use std::collections::HashMap;
 pub struct RefreshData {
     pub logs: Vec<LogView>,
     pub exec_errors: Vec<LogView>,
+    pub active_exec_errors: Vec<LogView>,
     pub artifacts: Vec<ArtifactView>,
     pub packages: Vec<PackageView>,
     pub deploy_errors: Vec<ErrorView>,
@@ -184,4 +186,26 @@ pub struct RefreshData {
     pub activity_sparkline: Vec<u64>,
     pub top_errors_barchart: Vec<(String, u64)>,
     pub status_counts: Vec<(String, u64)>,
+}
+
+// ─── Types d'alertes intelligentes ─────────────────────────────────────────
+
+/// Represents high‑level intelligent alert types. These enums carry
+/// additional contextual data when needed (e.g. number of recent errors or
+/// duration of a persistent failure). When converting from the JSON stored
+/// in `smart_alerts.extra`, you can match on the variant to build a
+/// descriptive Teams message. Note that the names must correspond to the
+/// values stored in the database (`SPIKE`, `REGRESSION`, `PERSISTENT`).
+#[derive(Debug, Clone)]
+pub enum AlertType {
+    /// An abrupt increase in the number of errors over the recent time
+    /// window compared to the historical baseline. Contains the number of
+    /// recent failed executions and the average per window.
+    Spike { recent_count: u64, avg_count: f64 },
+    /// A flow whose last execution status is `FAILED` whereas the previous
+    /// status was not `FAILED`, indicating a regression.
+    Regression,
+    /// A flow that remains in a failed state for an extended period. Stores
+    /// the duration in minutes since the last successful execution.
+    PersistentFailure { duration_mins: u64 },
 }

@@ -48,3 +48,54 @@ CREATE INDEX IF NOT EXISTS idx_logs_date ON sap_monitoring_logs (parsed_date DES
 CREATE INDEX IF NOT EXISTS idx_logs_status_date ON sap_monitoring_logs (status, parsed_date);
 CREATE INDEX IF NOT EXISTS idx_logs_flow_name ON sap_monitoring_logs (integration_flow_name);
 CREATE INDEX IF NOT EXISTS idx_artifacts_package ON runtime_artifacts (package_id);
+
+
+-- Ajouter tenant_id à toutes les tables
+ALTER TABLE integration_packages ADD COLUMN tenant_id VARCHAR(100) NOT NULL DEFAULT 'cerealog';
+ALTER TABLE runtime_artifacts ADD COLUMN tenant_id VARCHAR(100) NOT NULL DEFAULT 'cerealog';
+ALTER TABLE sap_monitoring_logs ADD COLUMN tenant_id VARCHAR(100) NOT NULL DEFAULT 'cerealog';
+ALTER TABLE artifact_errors ADD COLUMN tenant_id VARCHAR(100) NOT NULL DEFAULT 'cerealog';
+ALTER TABLE artifact_configurations ADD COLUMN tenant_id VARCHAR(100) NOT NULL DEFAULT 'cerealog';
+
+-- Table tenants
+CREATE TABLE IF NOT EXISTS tenants (
+    id VARCHAR(100) PRIMARY KEY,
+    name TEXT NOT NULL,
+    client_name TEXT,
+    shared_tenant BOOLEAN DEFAULT false,
+    sap_base_url TEXT,
+    sap_token_url TEXT,
+    active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Insérer le tenant Cerealog par défaut
+INSERT INTO tenants (id, name, client_name, shared_tenant, active)
+VALUES ('cerealog', 'Cerealog', 'Cerealog', false, true)
+ON CONFLICT (id) DO NOTHING;
+
+-- Index sur tenant_id
+CREATE INDEX IF NOT EXISTS idx_packages_tenant ON integration_packages (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_tenant ON runtime_artifacts (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_logs_tenant ON sap_monitoring_logs (tenant_id);
+
+-- Contraintes FK vers tenants
+ALTER TABLE integration_packages ADD CONSTRAINT fk_packages_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+ALTER TABLE runtime_artifacts ADD CONSTRAINT fk_artifacts_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+ALTER TABLE sap_monitoring_logs ADD CONSTRAINT fk_logs_tenant FOREIGN KEY (tenant_id) REFERENCES tenants(id);
+
+ALTER TABLE tenants ADD COLUMN sap_client_id TEXT;
+ALTER TABLE tenants ADD COLUMN sap_client_secret_enc TEXT; -- chiffré AES-GCM + base64
+
+DROP TABLE IF EXISTS smart_alerts;
+
+CREATE TABLE smart_alerts (
+    id                BIGSERIAL PRIMARY KEY,
+    tenant_id         VARCHAR(100) NOT NULL,
+    flow_name         TEXT NOT NULL,
+    alert_type        TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'PENDING',
+    last_triggered_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    extra             JSONB,
+    CONSTRAINT smart_alerts_unique UNIQUE (tenant_id, flow_name, alert_type)
+);

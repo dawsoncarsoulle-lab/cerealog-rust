@@ -1,8 +1,10 @@
 mod api;
 mod config;
+mod crypto;
 mod db;
 mod models;
 mod queries;
+mod tenant_setup;
 mod ui;
 mod utils;
 mod webhook;
@@ -22,190 +24,10 @@ struct Cli {
     health: bool,
     #[arg(long)]
     full: bool,
-    #[arg(
-        long,
-        help = "Lance un test de performance brut 1:1 avec Python (sans UI ni BDD)"
-    )]
+    #[arg(long)]
     benchmark: bool,
-}
-
-// ─── BENCHMARK 100% EQUITABLE AVEC PYTHON ─────────────────────────────────────
-
-async fn run_benchmark(sap_config: SapConfig, top: u32) -> anyhow::Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::Semaphore;
-
-    let start = std::time::Instant::now();
-    println!("Démarrage du benchmark Rust (reqwest/tokio)...");
-
-    let client = api::build_http_client()?;
-
-    // 1. Auth
-    let token_cache = api::get_sap_token(&client, &sap_config).await?;
-    let token = token_cache.get().to_string();
-    println!(
-        "Token OAuth obtenu en {:.3}s",
-        start.elapsed().as_secs_f64()
-    );
-
-    let log_concurrency = 50usize;
-    let concurrency = 20usize;
-
-    let logs_url = sap_config.logs_url(top, None);
-    let logs_fut = {
-        let client = client.clone();
-        let token = token.clone();
-        async move {
-            let res = client
-                .get(&logs_url)
-                .bearer_auth(&token)
-                .header("Accept", "application/json")
-                .send()
-                .await?;
-            let odata: models::ODataResponse = res.json().await?;
-            anyhow::Ok(odata.d.results)
-        }
-    };
-
-    let (logs_res, pkgs_res, arts_res) = tokio::join!(
-        logs_fut,
-        api::fetch_packages(&client, &token, &sap_config),
-        api::fetch_artifacts(&client, &token, &sap_config),
-    );
-
-    let logs = logs_res?;
-    let packages = pkgs_res?;
-    let artifacts = arts_res?;
-
-    let pkg_ids: Vec<String> = packages.iter().filter_map(|p| p.id.clone()).collect();
-    let config_fut = {
-        let client = client.clone();
-        let token = token.clone();
-        let sap_config = sap_config.clone();
-        async move {
-            let mapping = api::fetch_all_package_artifacts(
-                &client,
-                &token,
-                &sap_config,
-                &pkg_ids,
-                concurrency,
-            )
-            .await;
-            let all_art_ids: Vec<String> = mapping.into_values().flatten().collect();
-
-            let sem = Arc::new(Semaphore::new(concurrency));
-            let handles: Vec<_> = all_art_ids
-                .into_iter()
-                .map(|art_id| {
-                    let c = client.clone();
-                    let t = token.clone();
-                    let sc = sap_config.clone();
-                    let sem = sem.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await.unwrap();
-                        let _ = api::fetch_artifact_properties(&c, &t, &sc, &art_id).await;
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.await;
-            }
-            anyhow::Ok(())
-        }
-    };
-
-    // ── Bloc B : Erreurs des logs FAILED ─────────────────────────────────────
-    let failed_guids: Vec<String> = logs
-        .iter()
-        .filter(|l| l.status.as_deref() == Some("FAILED"))
-        .filter_map(|l| l.message_guid.clone())
-        .collect();
-
-    let log_errors_fut = {
-        let client = client.clone();
-        let token = token.clone();
-        let sap_config = sap_config.clone();
-        let count = failed_guids.len();
-        async move {
-            let sem = Arc::new(Semaphore::new(log_concurrency));
-            let handles: Vec<_> = failed_guids
-                .into_iter()
-                .map(|guid| {
-                    let c = client.clone();
-                    let t = token.clone();
-                    let sc = sap_config.clone();
-                    let sem = sem.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await.unwrap();
-                        let url = sc.log_error_url(&guid);
-                        let _ = c.get(&url).bearer_auth(&t).send().await;
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.await;
-            }
-            count
-        }
-    };
-
-    // ── Bloc C : Erreurs des artifacts ERROR ──────────────────────────────────
-    let error_ids: Vec<String> = artifacts
-        .iter()
-        .filter(|a| a.status.as_deref() == Some("ERROR"))
-        .filter_map(|a| a.id.clone())
-        .collect();
-
-    let art_errors_fut = {
-        let client = client.clone();
-        let token = token.clone();
-        let sap_config = sap_config.clone();
-        let count = error_ids.len();
-        async move {
-            let sem = Arc::new(Semaphore::new(concurrency));
-            let handles: Vec<_> = error_ids
-                .into_iter()
-                .map(|id| {
-                    let c = client.clone();
-                    let t = token.clone();
-                    let sc = sap_config.clone();
-                    let sem = sem.clone();
-                    tokio::spawn(async move {
-                        let _permit = sem.acquire_owned().await.unwrap();
-                        let _ = api::fetch_artifact_error(&c, &t, &sc, &id).await;
-                    })
-                })
-                .collect();
-
-            for h in handles {
-                let _ = h.await;
-            }
-            count
-        }
-    };
-
-    // 4. Les 3 blocs lourds en parallèle — identique à asyncio.gather() Python
-    let (_, fetched_log_errs, fetched_art_errs) =
-        tokio::join!(config_fut, log_errors_fut, art_errors_fut);
-
-    let elapsed = start.elapsed();
-    println!("\n==================================================");
-    println!("RÉSULTATS DU BENCHMARK RUST (FULL DEEP FETCH)");
-    println!("==================================================");
-    println!("Logs extraits         : {}", logs.len());
-    println!("Packages extraits     : {}", packages.len());
-    println!("Artifacts extraits    : {}", artifacts.len());
-    println!("Erreurs Logs lues     : {}", fetched_log_errs);
-    println!("Erreurs Artifacts lues: {}", fetched_art_errs);
-    println!(
-        "TEMPS TOTAL           : {:.3} secondes",
-        elapsed.as_secs_f64()
-    );
-    println!("==================================================");
-
-    Ok(())
+    #[arg(long)]
+    add_tenant: bool,
 }
 
 // ─── Synchronisation logs ─────────────────────────────────────────────────────
@@ -220,10 +42,14 @@ async fn sync_logs(
     concurrency: usize,
 ) -> anyhow::Result<()> {
     let filter = if incremental {
-        match db::get_latest_log_date(&pool).await? {
+        match db::get_latest_log_date(&pool, &sap_config.tenant_id).await? {
             Some(last_date) => {
                 let since = last_date.format("%Y-%m-%dT%H:%M:%S").to_string();
-                log::info!("Fetch incrémental depuis {}", since);
+                log::info!(
+                    "[{}] Fetch incrémental depuis {}",
+                    sap_config.tenant_id,
+                    since
+                );
                 Some(format!("LogStart gt datetime'{}'", since))
             }
             None => None,
@@ -242,8 +68,8 @@ async fn sync_logs(
     )
     .await?;
     if !logs.is_empty() {
-        log::info!("{} logs à insérer.", logs.len());
-        db::insert_logs(&pool, logs).await?;
+        log::info!("[{}] {} logs à insérer.", sap_config.tenant_id, logs.len());
+        db::insert_logs(&pool, &sap_config.tenant_id, logs).await?;
     }
     Ok(())
 }
@@ -273,8 +99,8 @@ async fn sync_packages_and_artifacts(
         .collect();
 
     let (r1, r2) = tokio::join!(
-        db::insert_packages(&pool, packages),
-        db::insert_artifacts(&pool, artifacts),
+        db::insert_packages(&pool, &sap_config.tenant_id, packages),
+        db::insert_artifacts(&pool, &sap_config.tenant_id, artifacts),
     );
     r1?;
     r2?;
@@ -291,6 +117,7 @@ async fn sync_packages_and_artifacts(
                     let snippet: String = err_txt.chars().take(200).collect();
                     let _ = db::insert_artifact_error(
                         &pool,
+                        &sap_config.tenant_id,
                         models::ArtifactError {
                             artifact_id: id.clone(),
                             error_message: err_txt,
@@ -298,7 +125,15 @@ async fn sync_packages_and_artifacts(
                         },
                     )
                     .await;
-                    let _ = db::insert_pending_alert(&pool, &id, &id, "deploy", &snippet).await;
+                    let _ = db::insert_pending_alert(
+                        &pool,
+                        &sap_config.tenant_id,
+                        &id,
+                        &id,
+                        "deploy",
+                        &snippet,
+                    )
+                    .await;
                 }
                 Ok(None) => {}
                 Err(e) => log::warn!("Fetch erreur artifact {}: {}", id, e),
@@ -347,7 +182,9 @@ async fn sync_configurations(
         handles.push(tokio::spawn(async move {
             match api::fetch_artifact_properties(&client, &token, &sap_config, &art_id).await {
                 Ok(cfgs) => {
-                    if let Err(e) = db::insert_configurations(&pool, &art_id, cfgs).await {
+                    if let Err(e) =
+                        db::insert_configurations(&pool, &sap_config.tenant_id, &art_id, cfgs).await
+                    {
                         log::warn!("Insert configs {} échoué: {}", art_id, e);
                     }
                 }
@@ -367,7 +204,7 @@ async fn sync_configurations(
     Ok(())
 }
 
-// ─── Worker de fetch ──────────────────────────────────────────────────────────
+// ─── Worker de fetch (un par tenant) ─────────────────────────────────────────
 
 async fn run_fetch_worker(
     pool: sqlx::PgPool,
@@ -376,12 +213,15 @@ async fn run_fetch_worker(
     incremental: bool,
     tx: mpsc::Sender<RefreshData>,
 ) {
+    let tenant_id = sap_config.tenant_id.clone();
+
     let send_fallback = |tx: mpsc::Sender<RefreshData>, pool: sqlx::PgPool| async move {
         let data = queries::build_refresh_data(&pool, top)
             .await
             .unwrap_or_else(|_| RefreshData {
                 logs: vec![],
                 exec_errors: vec![],
+                active_exec_errors: vec![],
                 artifacts: vec![],
                 packages: vec![],
                 deploy_errors: vec![],
@@ -396,29 +236,27 @@ async fn run_fetch_worker(
         let _ = tx.send(data).await;
     };
 
-    let mut u_config = UserConfig::load();
-
+    // Chaque worker gère son token en mémoire (pas de cache disque partagé)
     let client = match api::build_http_client() {
         Ok(c) => c,
         Err(e) => {
-            log::error!("HTTP client: {}", e);
+            log::error!("[{}] HTTP client: {}", tenant_id, e);
             send_fallback(tx, pool).await;
             return;
         }
     };
 
-    let mut token_cache = match api::get_or_refresh_token(&client, &sap_config, &mut u_config).await
-    {
+    let mut token_cache = match api::get_sap_token(&client, &sap_config).await {
         Ok(t) => t,
         Err(e) => {
-            log::error!("Auth worker: {}", e);
+            log::error!("[{}] Auth worker: {}", tenant_id, e);
             send_fallback(tx, pool).await;
             return;
         }
     };
 
     if let Err(e) = api::ensure_valid_token(&client, &sap_config, &mut token_cache).await {
-        log::error!("ensure_valid_token: {}", e);
+        log::error!("[{}] ensure_valid_token: {}", tenant_id, e);
         send_fallback(tx, pool).await;
         return;
     }
@@ -436,30 +274,37 @@ async fn run_fetch_worker(
                 pool.clone(),
                 top,
                 true,
-                log_concurrency,
+                log_concurrency
             ),
             api::fetch_artifacts(&client, &token, &sap_config)
         );
 
         if let Err(e) = logs_res {
-            log::error!("sync_logs échoué: {}", e);
+            log::error!("[{}] sync_logs échoué: {}", tenant_id, e);
         }
 
         if let Ok(artifacts) = artifacts_res {
-            let _ = db::insert_artifacts(&pool, artifacts.clone()).await;
+            let _ = db::insert_artifacts(&pool, &tenant_id, artifacts.clone()).await;
             for a in artifacts {
                 if a.status.as_deref() == Some("ERROR") {
                     if let Some(id) = a.id {
+                        // 1. On crée les clones POUR CETTE itération de la boucle
                         let c = client.clone();
                         let t = token.clone();
                         let sc = sap_config.clone();
                         let p = pool.clone();
+                        let t_id = sap_config.tenant_id.clone(); // On clone le String spécifiquement
+
+                        // 2. On donne ces clones à la tâche async
                         tokio::spawn(async move {
+                            // On utilise sc, c, t, p et t_id à l'intérieur (JAMAIS pool ou sap_config)
                             if let Ok(Some(err)) = api::fetch_artifact_error(&c, &t, &sc, &id).await
                             {
                                 let snippet: String = err.chars().take(200).collect();
+
                                 let _ = db::insert_artifact_error(
                                     &p,
+                                    &t_id,
                                     models::ArtifactError {
                                         artifact_id: id.clone(),
                                         error_message: err,
@@ -467,8 +312,12 @@ async fn run_fetch_worker(
                                     },
                                 )
                                 .await;
-                                let _ = db::insert_pending_alert(&p, &id, &id, "deploy", &snippet)
-                                    .await;
+
+                                // On utilise t_id ici !
+                                let _ = db::insert_pending_alert(
+                                    &p, &t_id, &id, &id, "deploy", &snippet,
+                                )
+                                .await;
                             }
                         });
                     }
@@ -484,25 +333,25 @@ async fn run_fetch_worker(
                 pool.clone(),
                 top,
                 false,
-                log_concurrency,
+                log_concurrency
             ),
             sync_packages_and_artifacts(
                 client.clone(),
                 token.clone(),
                 sap_config.clone(),
                 pool.clone(),
-                concurrency,
+                concurrency
             )
         );
 
         if let Err(e) = logs_res {
-            log::error!("sync_logs échoué: {}", e);
+            log::error!("[{}] sync_logs échoué: {}", tenant_id, e);
         }
 
         let pkg_ids = match packages_res {
             Ok(ids) => ids,
             Err(e) => {
-                log::error!("sync_packages échoué: {}", e);
+                log::error!("[{}] sync_packages échoué: {}", tenant_id, e);
                 Vec::new()
             }
         };
@@ -518,7 +367,7 @@ async fn run_fetch_worker(
             )
             .await
             {
-                log::warn!("sync_configs: {}", e);
+                log::warn!("[{}] sync_configs: {}", tenant_id, e);
             }
         }
     }
@@ -533,7 +382,15 @@ async fn run_fetch_worker(
                     .chars()
                     .take(200)
                     .collect::<String>();
-                let _ = db::insert_pending_alert(&pool, guid, flow, "exec", &snippet).await;
+                let _ = db::insert_pending_alert(
+                    &pool,
+                    &sap_config.tenant_id,
+                    guid,
+                    flow,
+                    "exec",
+                    &snippet,
+                )
+                .await;
             }
         }
     }
@@ -546,54 +403,80 @@ async fn run_fetch_worker(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-
     let cli = Cli::parse();
 
-    // Mode Benchmark : pas de logger, pas de DB
     if cli.benchmark {
-        let sap_config = SapConfig::from_env()?;
-        let top = cli.top.unwrap_or(500);
-        run_benchmark(sap_config, top).await?;
+        println!("benchmark désactivé dans cette version");
         return Ok(());
     }
 
     env_logger::init();
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
-    let sap_config = SapConfig::from_env()?;
-    let user_config = UserConfig::load();
 
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL manquante dans .env");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&db_url)
         .await?;
 
-    db::ensure_pending_alerts_table(&pool).await?;
-
-    if cli.health {
-        let pb = utils::create_spinner("Vérification des connexions...");
-        let client = api::build_http_client()?;
-        api::get_sap_token(&client, &sap_config).await?;
-        pb.finish_with_message("✓ SAP OK  ✓ DB OK");
+    // ── Commande add-tenant (avant tout le reste)
+    if cli.add_tenant {
+        tenant_setup::add_tenant_interactive(&pool).await?;
         return Ok(());
     }
 
+    db::ensure_pending_alerts_table(&pool).await?;
+    db::ensure_smart_alerts_table(&pool).await?;
+
+    // ── Charger les tenants depuis la BDD
+    let configs = SapConfig::load_all_from_db(&pool).await?;
+    if configs.is_empty() {
+        anyhow::bail!("Aucun tenant actif trouvé en BDD. Lance `--add-tenant` pour en ajouter un.");
+    }
+    log::info!(
+        "{} tenant(s) chargé(s) : {}",
+        configs.len(),
+        configs
+            .iter()
+            .map(|c| c.tenant_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // ── Health check
+    if cli.health {
+        let pb = utils::create_spinner("Vérification des connexions...");
+        let client = api::build_http_client()?;
+        for cfg in &configs {
+            api::get_sap_token(&client, cfg).await?;
+            log::info!("✓ Tenant '{}' OK", cfg.tenant_id);
+        }
+        pb.finish_with_message(format!("✓ {} tenant(s) OK  ✓ DB OK", configs.len()));
+        return Ok(());
+    }
+
+    let user_config = UserConfig::load();
     let top = cli.top.unwrap_or(user_config.logs_limit);
     let mut app = App::new(user_config);
 
-    let (tx, mut rx) = mpsc::channel::<RefreshData>(4);
+    let (tx, mut rx) = mpsc::channel::<RefreshData>(configs.len() * 2 + 2);
 
-    {
-        let incremental = !cli.full && db::get_latest_log_date(&pool).await?.is_some();
+    // ── Spawner un worker par tenant
+    for cfg in &configs {
+        let incremental = !cli.full
+            && db::get_latest_log_date(&pool, &cfg.tenant_id)
+                .await?
+                .is_some();
         app.refreshing = true;
         tokio::spawn(run_fetch_worker(
             pool.clone(),
-            sap_config.clone(),
+            cfg.clone(),
             top,
             incremental,
             tx.clone(),
         ));
     }
 
+    // ── Webhook worker
     {
         let pool_w = pool.clone();
         tokio::spawn(async move {
@@ -603,10 +486,15 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = webhook::process_pending_alerts(&pool_w).await {
                     log::warn!("Webhook worker: {}", e);
                 }
+                if let Err(e) = webhook::process_smart_alerts(&pool_w).await {
+                    log::warn!("Smart alert worker: {}", e);
+                }
             }
         });
     }
 
+    // ── Boucle UI
+    let configs_arc = std::sync::Arc::new(configs);
     loop {
         let event = ui::run_tui(&mut app, &mut rx)?;
 
@@ -617,31 +505,37 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             AppEvent::TriggerRefresh { full } => {
-                tokio::spawn(run_fetch_worker(
-                    pool.clone(),
-                    sap_config.clone(),
-                    app.logs_limit,
-                    !full,
-                    tx.clone(),
-                ));
+                for cfg in configs_arc.iter() {
+                    tokio::spawn(run_fetch_worker(
+                        pool.clone(),
+                        cfg.clone(),
+                        app.logs_limit,
+                        !full,
+                        tx.clone(),
+                    ));
+                }
             }
             AppEvent::LoadMore => {
-                tokio::spawn(run_fetch_worker(
-                    pool.clone(),
-                    sap_config.clone(),
-                    app.logs_limit,
-                    false,
-                    tx.clone(),
-                ));
+                for cfg in configs_arc.iter() {
+                    tokio::spawn(run_fetch_worker(
+                        pool.clone(),
+                        cfg.clone(),
+                        app.logs_limit,
+                        false,
+                        tx.clone(),
+                    ));
+                }
             }
             AppEvent::Continue => {
-                tokio::spawn(run_fetch_worker(
-                    pool.clone(),
-                    sap_config.clone(),
-                    app.logs_limit,
-                    true,
-                    tx.clone(),
-                ));
+                for cfg in configs_arc.iter() {
+                    tokio::spawn(run_fetch_worker(
+                        pool.clone(),
+                        cfg.clone(),
+                        app.logs_limit,
+                        true,
+                        tx.clone(),
+                    ));
+                }
             }
         }
     }

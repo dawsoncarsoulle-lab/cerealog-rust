@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-// ─── Configuration SAP (depuis les variables d'environnement) ────────────────
+// ─── Configuration SAP ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct SapConfig {
+    pub tenant_id: String,
     pub base_url: String,
     pub token_url: String,
     pub client_id: String,
@@ -14,24 +15,48 @@ pub struct SapConfig {
 }
 
 impl SapConfig {
+    /// Fallback .env pour compatibilité / health check
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("SAP_BASE_URL").context(
-            "Variable SAP_BASE_URL manquante. Exemple : https://xxx.it-cpi001.cfapps.eu10.hana.ondemand.com",
-        )?;
-        let token_url = std::env::var("SAP_TOKEN_URL").context(
-            "Variable SAP_TOKEN_URL manquante. Exemple : https://xxx.authentication.eu10.hana.ondemand.com/oauth/token?grant_type=client_credentials&token_format=jwt",
-        )?;
-        let client_id = std::env::var("CLIENT_ID")
-            .context("Variable CLIENT_ID manquante (vérifie ton fichier .env)")?;
-        let client_secret = std::env::var("CLIENT_SECRET")
-            .context("Variable CLIENT_SECRET manquante (vérifie ton fichier .env)")?;
+        let base_url = std::env::var("SAP_BASE_URL").context("Variable SAP_BASE_URL manquante.")?;
+        let token_url =
+            std::env::var("SAP_TOKEN_URL").context("Variable SAP_TOKEN_URL manquante.")?;
+        let client_id = std::env::var("CLIENT_ID").context("Variable CLIENT_ID manquante")?;
+        let client_secret =
+            std::env::var("CLIENT_SECRET").context("Variable CLIENT_SECRET manquante")?;
 
         Ok(Self {
+            tenant_id: std::env::var("TENANT_ID").unwrap_or_else(|_| "cerealog".to_string()),
             base_url,
             token_url,
             client_id,
             client_secret,
         })
+    }
+
+    /// Charger tous les tenants actifs depuis la BDD
+    pub async fn load_all_from_db(pool: &sqlx::PgPool) -> Result<Vec<Self>> {
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, sap_base_url, sap_token_url, sap_client_id, sap_client_secret_enc
+             FROM tenants
+             WHERE active = true
+               AND sap_base_url IS NOT NULL
+               AND sap_client_id IS NOT NULL",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|(id, base_url, token_url, client_id, secret_enc)| {
+                let client_secret = crate::crypto::decrypt(&secret_enc)?;
+                Ok(Self {
+                    tenant_id: id,
+                    base_url,
+                    token_url,
+                    client_id,
+                    client_secret,
+                })
+            })
+            .collect()
     }
 
     pub fn packages_url(&self) -> String {
@@ -44,9 +69,9 @@ impl SapConfig {
 
     pub fn logs_url(&self, top: u32, filter: Option<&str>) -> String {
         let mut url = format!(
-                "{}/api/v1/MessageProcessingLogs?$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart desc&$top={}",
-                self.base_url, top
-            );
+            "{}/api/v1/MessageProcessingLogs?$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart desc&$top={}",
+            self.base_url, top
+        );
         if let Some(f) = filter {
             url.push_str(&format!("&$filter={}", f));
         }
@@ -82,7 +107,7 @@ impl SapConfig {
     }
 }
 
-// ─── Cache de token OAuth avec gestion d'expiration ─────────────────────────
+// ─── Cache de token OAuth ────────────────────────────────────────────────────
 
 pub struct TokenCache {
     pub token: String,
@@ -98,7 +123,6 @@ impl TokenCache {
     }
 
     pub fn is_expired(&self) -> bool {
-        // Renouvelle 60s avant l'expiration réelle
         Instant::now() >= self.expires_at - Duration::from_secs(60)
     }
 
@@ -119,6 +143,7 @@ impl TokenCache {
 pub struct UserConfig {
     pub logs_limit: u32,
     pub parallel_requests: usize,
+    /// Cache token supprimé du disque — géré en mémoire par tenant désormais
     #[serde(default)]
     pub cached_token: Option<String>,
     #[serde(default)]

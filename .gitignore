@@ -3,3 +3,5 @@
 .secrets/
 /target
 update.md
+tmp.md
+install.sh
