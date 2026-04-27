@@ -9,7 +9,7 @@ pub async fn build_refresh_data(pool: &sqlx::PgPool, logs_limit: u32) -> Result<
     let (
         logs_res,
         exec_errors_res,
-        active_exec_errors_res, // <-- nouveau
+        active_exec_errors_res,
         artifacts_res,
         packages_res,
         deploy_errors_res,
@@ -24,7 +24,7 @@ pub async fn build_refresh_data(pool: &sqlx::PgPool, logs_limit: u32) -> Result<
     ) = tokio::join!(
         fetch_logs(pool, logs_limit),
         fetch_exec_errors(pool),
-        fetch_active_exec_errors(pool), // <-- nouveau
+        fetch_active_exec_errors(pool),
         fetch_artifacts(pool),
         fetch_packages(pool),
         fetch_deploy_errors(pool),

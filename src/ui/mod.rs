@@ -95,10 +95,9 @@ fn run_loop<B: ratatui::backend::Backend>(
                 }
 
                 if let OverlayState::TenantFilter { selected } = app.overlay {
-                    // On copie la valeur de `selected`, donc on ne bloque plus `app` !
                     let mut new_selected = selected;
                     let tenants = app.available_tenants();
-                    let total = tenants.len() + 1; // +1 pour "Tous"
+                    let total = tenants.len() + 1;
 
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('q') => {

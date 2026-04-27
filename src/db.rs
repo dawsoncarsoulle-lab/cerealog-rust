@@ -352,7 +352,6 @@ pub async fn ensure_pending_alerts_table(pool: &sqlx::PgPool) -> Result<()> {
 }
 
 // ─── Smart Alerts (intelligent alerting) ────────────────────────────────────
-// ─── Smart Alerts (intelligent alerting) ────────────────────────────────────
 
 pub async fn ensure_smart_alerts_table(pool: &sqlx::PgPool) -> Result<()> {
     sqlx::query(

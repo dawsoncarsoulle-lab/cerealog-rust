@@ -288,16 +288,13 @@ async fn run_fetch_worker(
             for a in artifacts {
                 if a.status.as_deref() == Some("ERROR") {
                     if let Some(id) = a.id {
-                        // 1. On crée les clones POUR CETTE itération de la boucle
                         let c = client.clone();
                         let t = token.clone();
                         let sc = sap_config.clone();
                         let p = pool.clone();
-                        let t_id = sap_config.tenant_id.clone(); // On clone le String spécifiquement
+                        let t_id = sap_config.tenant_id.clone();
 
-                        // 2. On donne ces clones à la tâche async
                         tokio::spawn(async move {
-                            // On utilise sc, c, t, p et t_id à l'intérieur (JAMAIS pool ou sap_config)
                             if let Ok(Some(err)) = api::fetch_artifact_error(&c, &t, &sc, &id).await
                             {
                                 let snippet: String = err.chars().take(200).collect();
@@ -313,7 +310,6 @@ async fn run_fetch_worker(
                                 )
                                 .await;
 
-                                // On utilise t_id ici !
                                 let _ = db::insert_pending_alert(
                                     &p, &t_id, &id, &id, "deploy", &snippet,
                                 )
@@ -418,7 +414,6 @@ async fn main() -> anyhow::Result<()> {
         .connect(&db_url)
         .await?;
 
-    // ── Commande add-tenant (avant tout le reste)
     if cli.add_tenant {
         tenant_setup::add_tenant_interactive(&pool).await?;
         return Ok(());
@@ -427,7 +422,6 @@ async fn main() -> anyhow::Result<()> {
     db::ensure_pending_alerts_table(&pool).await?;
     db::ensure_smart_alerts_table(&pool).await?;
 
-    // ── Charger les tenants depuis la BDD
     let configs = SapConfig::load_all_from_db(&pool).await?;
     if configs.is_empty() {
         anyhow::bail!("Aucun tenant actif trouvé en BDD. Lance `--add-tenant` pour en ajouter un.");

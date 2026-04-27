@@ -395,10 +395,8 @@ pub fn draw_overlay_tenant(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(Clear, popup_area);
 
-    // Construire les lignes
     let mut lines: Vec<Line> = vec![];
 
-    // "Tous les tenants" — index 0
     let all_style = if selected == 0 {
         Style::default()
             .bg(C_SEL_BG)
@@ -413,7 +411,6 @@ pub fn draw_overlay_tenant(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("Tous les tenants", all_style),
     ]));
 
-    // Un item par tenant
     let tenant_colors = [C_ACCENT, C_AMBER, C_BLUE, C_RED, C_GREEN];
     for (i, tenant) in tenants.iter().enumerate() {
         let idx = i + 1;
@@ -447,7 +444,6 @@ pub fn draw_overlay_tenant(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    // Contenu
     for (i, line) in lines.iter().enumerate() {
         if i >= inner.height as usize {
             break;
@@ -461,7 +457,6 @@ pub fn draw_overlay_tenant(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new(line.clone()), row);
     }
 
-    // Footer
     let footer_y = inner.y + inner.height.saturating_sub(1);
     f.render_widget(
         Paragraph::new(Span::styled(

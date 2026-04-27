@@ -330,18 +330,14 @@ impl App {
     }
 
     pub fn apply_filters(&mut self) {
-        // Smart search (version B): parse key:value pairs, fuzzy matching and synonyms
-        // We keep the original order of items (chronological order) while filtering.
         let raw_query = self.search_query.trim();
         let (free_terms, mut filters) = parse_query(raw_query);
 
-        // canonicalize keys and drop unknowns
         filters = filters
             .into_iter()
             .filter_map(|(k, v)| unify_key(&k).map(|key| (key, v)))
             .collect();
 
-        // Prepare date and tenant filters
         let date_range = self.date_filter;
         let tenant_filter = self.tenant_filter.clone();
         let tenant_ok = |tenant: Option<&str>| -> bool {
@@ -361,13 +357,11 @@ impl App {
             }
         };
 
-        // Helper: check if a log matches all filters
         let log_filter_ok = |l: &LogView| -> bool {
             for (key, val) in &filters {
                 let expected = val.to_lowercase();
                 match key.as_str() {
                     "status" => {
-                        // Canonicalize both sides
                         let cur = l.status.as_deref().unwrap_or("").to_lowercase();
                         if unify_status(&cur) != unify_status(&expected) {
                             return false;
@@ -407,7 +401,6 @@ impl App {
             true
         };
 
-        // Helper: check if all free terms appear somewhere in the log
         let log_free_ok = |l: &LogView| -> bool {
             if free_terms.is_empty() {
                 return true;
@@ -469,7 +462,6 @@ impl App {
                 && tenant_ok(l.tenant_id.as_deref())
         };
 
-        // Filter logs preserving order
         self.filtered_logs = self.logs.iter().filter(log_matches).cloned().collect();
         self.filtered_exec_errors = self
             .exec_errors
@@ -484,7 +476,6 @@ impl App {
             .cloned()
             .collect();
 
-        // Artifacts: only apply free terms, date and tenant filters
         let artifact_free_ok = |a: &ArtifactView| -> bool {
             if free_terms.is_empty() {
                 return true;
@@ -536,7 +527,6 @@ impl App {
             .cloned()
             .collect();
 
-        // Packages: only apply free terms, date and tenant filters
         let package_free_ok = |p: &PackageView| -> bool {
             if free_terms.is_empty() {
                 return true;
@@ -582,7 +572,6 @@ impl App {
             .cloned()
             .collect();
 
-        // Deploy errors: apply free terms and filters for tenant and date
         let deploy_free_ok = |e: &ErrorView| -> bool {
             if free_terms.is_empty() {
                 return true;
