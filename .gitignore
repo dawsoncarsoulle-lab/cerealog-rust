@@ -1,0 +1,8 @@
+.env
+.env.*
+.secrets/
+/target
+update.md
+tmp.md
+install.sh
+SAP_BTP_Monitor_Documentation.docx
