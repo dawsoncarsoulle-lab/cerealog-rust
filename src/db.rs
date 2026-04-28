@@ -1,63 +1,185 @@
 use crate::models::{ArtifactError, IntegrationPackage, LogEntry, RuntimeArtifact};
-use anyhow::Result;
-use serde_json;
+use anyhow::{Context, Result};
 use sqlx::{Postgres, QueryBuilder};
 
-const LOG_INSERT_BATCH_SIZE: usize = 5_000;
+const LOG_COPY_BATCH_SIZE: usize = 100_000;
 const PACKAGE_INSERT_BATCH_SIZE: usize = 2_000;
 const ARTIFACT_INSERT_BATCH_SIZE: usize = 2_000;
 const MAPPING_UPDATE_BATCH_SIZE: usize = 10_000;
 
 // ─── Insertions batchées ─────────────────────────────────────────────────────
 
+/// Insertion haute performance des logs.
+///
+/// Stratégie:
+/// 1. COPY FROM STDIN vers une table temporaire PostgreSQL.
+/// 2. Déduplication par message_guid dans la table temporaire.
+/// 3. INSERT ... SELECT ... ON CONFLICT vers sap_monitoring_logs.
+///
+/// C'est nettement plus adapté aux gros backfills que `INSERT VALUES (...), (...)`.
 pub async fn insert_logs(pool: &sqlx::PgPool, tenant_id: &str, logs: Vec<LogEntry>) -> Result<()> {
     if logs.is_empty() {
         return Ok(());
     }
 
-    let mut batch = Vec::with_capacity(LOG_INSERT_BATCH_SIZE);
+    let mut batch = Vec::with_capacity(LOG_COPY_BATCH_SIZE.min(logs.len()));
     for log in logs {
         batch.push(log);
-        if batch.len() >= LOG_INSERT_BATCH_SIZE {
-            insert_logs_batch(pool, tenant_id, std::mem::take(&mut batch)).await?;
+        if batch.len() >= LOG_COPY_BATCH_SIZE {
+            insert_logs_copy_batch(pool, tenant_id, std::mem::take(&mut batch)).await?;
         }
     }
+
     if !batch.is_empty() {
-        insert_logs_batch(pool, tenant_id, batch).await?;
+        insert_logs_copy_batch(pool, tenant_id, batch).await?;
     }
+
     Ok(())
 }
 
-async fn insert_logs_batch(
+async fn insert_logs_copy_batch(
     pool: &sqlx::PgPool,
     tenant_id: &str,
     logs: Vec<LogEntry>,
 ) -> Result<()> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "INSERT INTO sap_monitoring_logs \
-         (message_guid, status, parsed_date, error_message, integration_flow_name, tenant_id) ",
-    );
+    if logs.is_empty() {
+        return Ok(());
+    }
 
-    qb.push_values(logs, |mut b, log| {
-        b.push_bind(log.message_guid)
-            .push_bind(log.status)
-            .push_bind(log.parsed_date)
-            .push_bind(log.error_message)
-            .push_bind(log.integration_flow_name)
-            .push_bind(tenant_id);
-    });
+    let mut copy_payload = String::with_capacity(logs.len().saturating_mul(192));
+    for log in &logs {
+        push_copy_text(&mut copy_payload, log.message_guid.as_deref());
+        copy_payload.push('\t');
+        push_copy_text(&mut copy_payload, log.status.as_deref());
+        copy_payload.push('\t');
+        push_copy_timestamp(&mut copy_payload, log.parsed_date);
+        copy_payload.push('\t');
+        push_copy_text(&mut copy_payload, log.error_message.as_deref());
+        copy_payload.push('\t');
+        push_copy_text(&mut copy_payload, log.integration_flow_name.as_deref());
+        copy_payload.push('\t');
+        push_copy_text(&mut copy_payload, Some(tenant_id));
+        copy_payload.push('\n');
+    }
 
-    qb.push(
-        " ON CONFLICT (message_guid) DO UPDATE SET \
-         status = EXCLUDED.status, \
-         parsed_date = EXCLUDED.parsed_date, \
-         error_message = EXCLUDED.error_message, \
-         integration_flow_name = EXCLUDED.integration_flow_name, \
-         tenant_id = EXCLUDED.tenant_id",
-    );
+    let mut conn = pool.acquire().await.context("acquisition connexion PostgreSQL")?;
 
-    qb.build().execute(pool).await?;
-    Ok(())
+    sqlx::query("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .context("BEGIN insert_logs COPY")?;
+
+    let result: Result<()> = async {
+        sqlx::query(
+            "CREATE TEMP TABLE tmp_sap_monitoring_logs (
+                message_guid TEXT,
+                status TEXT,
+                parsed_date TIMESTAMP,
+                error_message TEXT,
+                integration_flow_name TEXT,
+                tenant_id TEXT
+            ) ON COMMIT DROP",
+        )
+        .execute(&mut *conn)
+        .await
+        .context("création table temporaire tmp_sap_monitoring_logs")?;
+
+        let copy_sql = "COPY tmp_sap_monitoring_logs \
+            (message_guid, status, parsed_date, error_message, integration_flow_name, tenant_id) \
+            FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')";
+
+        let mut copy = (&mut *conn)
+            .copy_in_raw(copy_sql)
+            .await
+            .context("démarrage COPY tmp_sap_monitoring_logs")?;
+
+        copy.send(copy_payload.as_bytes())
+            .await
+            .context("envoi données COPY tmp_sap_monitoring_logs")?;
+
+        let copied = copy
+            .finish()
+            .await
+            .context("finalisation COPY tmp_sap_monitoring_logs")?;
+
+        if copied != logs.len() as u64 {
+            log::warn!(
+                "COPY logs: lignes envoyées={} lignes copiées={}",
+                logs.len(),
+                copied
+            );
+        }
+
+        sqlx::query(
+            "INSERT INTO sap_monitoring_logs
+                (message_guid, status, parsed_date, error_message, integration_flow_name, tenant_id)
+             SELECT DISTINCT ON (message_guid)
+                message_guid,
+                status,
+                parsed_date,
+                error_message,
+                integration_flow_name,
+                tenant_id
+             FROM tmp_sap_monitoring_logs
+             WHERE message_guid IS NOT NULL
+               AND message_guid <> ''
+             ORDER BY message_guid, parsed_date DESC NULLS LAST
+             ON CONFLICT (message_guid) DO UPDATE SET
+                status = EXCLUDED.status,
+                parsed_date = COALESCE(EXCLUDED.parsed_date, sap_monitoring_logs.parsed_date),
+                error_message = COALESCE(EXCLUDED.error_message, sap_monitoring_logs.error_message),
+                integration_flow_name = COALESCE(EXCLUDED.integration_flow_name, sap_monitoring_logs.integration_flow_name),
+                tenant_id = EXCLUDED.tenant_id",
+        )
+        .execute(&mut *conn)
+        .await
+        .context("merge tmp_sap_monitoring_logs vers sap_monitoring_logs")?;
+
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => {
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .context("COMMIT insert_logs COPY")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(err)
+        }
+    }
+}
+
+fn push_copy_timestamp(buf: &mut String, value: Option<chrono::NaiveDateTime>) {
+    match value {
+        Some(dt) => buf.push_str(&dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+        None => buf.push_str("\\N"),
+    }
+}
+
+fn push_copy_text(buf: &mut String, value: Option<&str>) {
+    match value {
+        Some(text) => push_copy_escaped_text(buf, text),
+        None => buf.push_str("\\N"),
+    }
+}
+
+fn push_copy_escaped_text(buf: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '\\' => buf.push_str("\\\\"),
+            '\t' => buf.push_str("\\t"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\u{0008}' => buf.push_str("\\b"),
+            '\u{000C}' => buf.push_str("\\f"),
+            _ => buf.push(ch),
+        }
+    }
 }
 
 pub async fn insert_packages(

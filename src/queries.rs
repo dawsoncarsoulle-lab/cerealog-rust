@@ -267,7 +267,7 @@ pub async fn detect_spike(pool: &sqlx::PgPool) -> Result<Vec<(String, String, i6
             SELECT r.tenant_id,
                    r.integration_flow_name,
                    COUNT(*) AS recent_count,
-                   COALESCE((
+                   (COALESCE((
                      SELECT COUNT(*)
                      FROM sap_monitoring_logs s2
                      WHERE s2.tenant_id = r.tenant_id
@@ -275,7 +275,7 @@ pub async fn detect_spike(pool: &sqlx::PgPool) -> Result<Vec<(String, String, i6
                        AND s2.status = 'FAILED'
                        AND s2.parsed_date <= NOW() - INTERVAL '10 minutes'
                        AND s2.parsed_date > NOW() - INTERVAL '70 minutes'
-                   ),0) / 6.0 AS avg_count
+                   ),0)::double precision / 6.0::double precision) AS avg_count
             FROM sap_monitoring_logs r
             WHERE r.status = 'FAILED'
               AND r.parsed_date > NOW() - INTERVAL '10 minutes'
@@ -363,7 +363,7 @@ pub async fn detect_persistent_failure(pool: &sqlx::PgPool) -> Result<Vec<(Strin
             GROUP BY tenant_id, integration_flow_name
         )
         SELECT tenant_id, integration_flow_name,
-               EXTRACT(EPOCH FROM (NOW() - COALESCE(last_success, NOW()))) / 60 AS fail_duration
+               (EXTRACT(EPOCH FROM (NOW() - COALESCE(last_success, NOW())))::double precision / 60.0::double precision) AS fail_duration
         FROM last_dates
         WHERE (last_success IS NULL OR last_success < NOW() - INTERVAL '30 minutes')
           AND last_failed >= COALESCE(last_success, last_failed)

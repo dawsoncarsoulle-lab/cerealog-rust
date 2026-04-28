@@ -61,11 +61,11 @@ impl SapConfig {
     }
 
     pub fn packages_url(&self) -> String {
-        format!("{}/api/v1/IntegrationPackages", self.base_url)
+        format!("{}/api/v1/IntegrationPackages?$format=json", self.base_url)
     }
 
     pub fn artifacts_url(&self) -> String {
-        format!("{}/api/v1/IntegrationRuntimeArtifacts", self.base_url)
+        format!("{}/api/v1/IntegrationRuntimeArtifacts?$format=json", self.base_url)
     }
 
     pub fn logs_url(&self, top: u32, filter: Option<&str>) -> String {
@@ -76,7 +76,7 @@ impl SapConfig {
     /// SAP CPI OData supporte `$top` + `$skip` sur MessageProcessingLogs.
     pub fn logs_page_url(&self, top: u32, skip: u32, filter: Option<&str>) -> String {
         let mut url = format!(
-            "{}/api/v1/MessageProcessingLogs?$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart desc&$top={}&$skip={}",
+            "{}/api/v1/MessageProcessingLogs?$format=json&$select=MessageGuid,Status,LogStart,IntegrationFlowName&$orderby=LogStart%20desc&$top={}&$skip={}",
             self.base_url, top, skip
         );
         if let Some(f) = filter {
@@ -102,17 +102,22 @@ impl SapConfig {
 
     pub fn package_artifacts_url(&self, package_id: &str) -> String {
         format!(
-            "{}/api/v1/IntegrationPackages('{}')/IntegrationDesigntimeArtifacts",
-            self.base_url, package_id
+            "{}/api/v1/IntegrationPackages('{}')/IntegrationDesigntimeArtifacts?$format=json",
+            self.base_url, escape_odata_string_literal(package_id)
         )
     }
 
     pub fn artifact_configs_url(&self, artifact_id: &str) -> String {
         format!(
-            "{}/api/v1/IntegrationDesigntimeArtifacts(Id='{}',Version='active')/Configurations",
-            self.base_url, artifact_id
+            "{}/api/v1/IntegrationDesigntimeArtifacts(Id='{}',Version='active')/Configurations?$format=json",
+            self.base_url, escape_odata_string_literal(artifact_id)
         )
     }
+}
+
+fn escape_odata_string_literal(input: &str) -> String {
+    // OData string literals escape single quotes by doubling them.
+    input.replace('\'', "''")
 }
 
 fn encode_query_component(input: &str) -> String {

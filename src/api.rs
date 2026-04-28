@@ -1,6 +1,7 @@
 use crate::config::{SapConfig, TokenCache};
 use crate::models::{DesigntimeArtifact, ODataDesignResponse};
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use chrono::{DateTime, NaiveDateTime};
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
@@ -55,6 +56,77 @@ pub fn build_http_client_with_options(
     Ok(client)
 }
 
+fn body_snippet(body: &str) -> String {
+    let compact = body
+        .chars()
+        .take(600)
+        .collect::<String>()
+        .replace('\n', " ")
+        .replace('\r', " ");
+    if body.chars().count() > 600 {
+        format!("{}…", compact)
+    } else {
+        compact
+    }
+}
+
+async fn get_odata_json<T>(
+    client: &reqwest::Client,
+    token: &str,
+    tenant_id: &str,
+    label: &str,
+    url: String,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let res = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("Accept", "application/json")
+        .header("DataServiceVersion", "2.0")
+        .header("MaxDataServiceVersion", "2.0")
+        .send()
+        .await
+        .with_context(|| format!("[{}] requête {} échouée: {}", tenant_id, label, url))?;
+
+    let status = res.status();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<absent>")
+        .to_string();
+    let body = res
+        .text()
+        .await
+        .with_context(|| format!("[{}] lecture body {} impossible", tenant_id, label))?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "[{}] {} HTTP {} content-type={} url={} body={}",
+            tenant_id,
+            label,
+            status,
+            content_type,
+            url,
+            body_snippet(&body)
+        );
+    }
+
+    serde_json::from_str::<T>(&body).with_context(|| {
+        format!(
+            "[{}] réponse {} non-JSON ou format inattendu: HTTP {} content-type={} url={} body={}",
+            tenant_id,
+            label,
+            status,
+            content_type,
+            url,
+            body_snippet(&body)
+        )
+    })
+}
+
 // ─── Token OAuth ─────────────────────────────────────────────────────────────
 
 pub async fn get_sap_token(client: &reqwest::Client, config: &SapConfig) -> Result<TokenCache> {
@@ -98,10 +170,42 @@ pub async fn fetch_sap_logs(
     fetch_sap_logs_paged(client, token, config, top, top, filter, concurrency, true).await
 }
 
-/// Récupération paginée des MPL.
+/// Récupère une seule page de MPL.
+pub async fn fetch_sap_logs_page(
+    client: &reqwest::Client,
+    token: &str,
+    config: &SapConfig,
+    wanted: u32,
+    skip: u32,
+    filter: Option<&str>,
+    error_concurrency: usize,
+    fetch_error_details: bool,
+) -> Result<Vec<LogEntry>> {
+    let url = config.logs_page_url(wanted.clamp(1, 5_000), skip, filter);
+    let odata: ODataResponse = get_odata_json(
+        client,
+        token,
+        &config.tenant_id,
+        "MessageProcessingLogs",
+        url,
+    )
+    .await?;
+
+    let mut logs = odata.d.results;
+    for log in &mut logs {
+        log.parsed_date = clean_sap_date(log.log_start.as_deref());
+    }
+
+    if fetch_error_details {
+        enrich_failed_logs_with_errors(client, token, config, &mut logs, error_concurrency).await?;
+    }
+
+    Ok(logs)
+}
+
+/// Récupération paginée des MPL en mémoire.
 ///
-/// `max_records` borne le volume total d'un cycle, `page_size` borne chaque requête OData.
-/// Cela évite une réponse HTTP gigantesque et des batch SQL trop gros.
+/// Gardé pour compatibilité interne/tests. Pour les gros volumes, le daemon insère page par page.
 pub async fn fetch_sap_logs_paged(
     client: &reqwest::Client,
     token: &str,
@@ -118,44 +222,26 @@ pub async fn fetch_sap_logs_paged(
 
     while skip < max_records {
         let wanted = (max_records - skip).min(effective_page_size);
-        let url = config.logs_page_url(wanted, skip, filter);
-
-        let res = client
-            .get(&url)
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .with_context(|| format!("[{}] requête logs échouée", config.tenant_id))?;
-
-        if !res.status().is_success() {
-            anyhow::bail!(
-                "[{}] Erreur API SAP logs: HTTP {}",
-                config.tenant_id,
-                res.status()
-            );
-        }
-
-        let odata: ODataResponse = res.json().await?;
-        let fetched = odata.d.results.len() as u32;
+        let logs = fetch_sap_logs_page(
+            client,
+            token,
+            config,
+            wanted,
+            skip,
+            filter,
+            error_concurrency,
+            fetch_error_details,
+        )
+        .await?;
+        let fetched = logs.len() as u32;
         if fetched == 0 {
             break;
         }
-
-        all_logs.extend(odata.d.results);
-        if fetched < wanted {
-            break;
-        }
+        all_logs.extend(logs);
+        // Certains endpoints SAP CPI plafonnent silencieusement une page à 1000 résultats,
+        // même si `$top` est plus grand. On ne doit donc pas considérer `fetched < wanted`
+        // comme une fin de pagination. La vraie fin est une page vide ou `max_records` atteint.
         skip = skip.saturating_add(fetched);
-    }
-
-    for log in &mut all_logs {
-        log.parsed_date = clean_sap_date(log.log_start.as_deref());
-    }
-
-    if fetch_error_details {
-        enrich_failed_logs_with_errors(client, token, config, &mut all_logs, error_concurrency)
-            .await?;
     }
 
     Ok(all_logs)
@@ -220,23 +306,19 @@ pub async fn fetch_packages(
     token: &str,
     config: &SapConfig,
 ) -> Result<Vec<IntegrationPackage>> {
-    let res = client
-        .get(&config.packages_url())
-        .bearer_auth(token)
-        .header("Accept", "application/json")
-        .send()
-        .await?;
-
-    if res.status().is_success() {
-        let odata: ODataPackageResponse = res.json().await?;
-        let mut packages = odata.d.results;
-        for pkg in &mut packages {
-            pkg.parsed_creation_date = clean_sap_date(pkg.creation_date.as_deref());
-        }
-        Ok(packages)
-    } else {
-        anyhow::bail!("[{}] Échec Packages: HTTP {}", config.tenant_id, res.status());
+    let odata: ODataPackageResponse = get_odata_json(
+        client,
+        token,
+        &config.tenant_id,
+        "IntegrationPackages",
+        config.packages_url(),
+    )
+    .await?;
+    let mut packages = odata.d.results;
+    for pkg in &mut packages {
+        pkg.parsed_creation_date = clean_sap_date(pkg.creation_date.as_deref());
     }
+    Ok(packages)
 }
 
 // ─── Artifacts runtime ───────────────────────────────────────────────────────
@@ -246,23 +328,19 @@ pub async fn fetch_artifacts(
     token: &str,
     config: &SapConfig,
 ) -> Result<Vec<RuntimeArtifact>> {
-    let res = client
-        .get(&config.artifacts_url())
-        .bearer_auth(token)
-        .header("Accept", "application/json")
-        .send()
-        .await?;
-
-    if res.status().is_success() {
-        let odata: ODataArtifactResponse = res.json().await?;
-        let mut artifacts = odata.d.results;
-        for art in &mut artifacts {
-            art.parsed_deployed_on = clean_sap_date(art.deployed_on.as_deref());
-        }
-        Ok(artifacts)
-    } else {
-        anyhow::bail!("[{}] Échec Artifacts: HTTP {}", config.tenant_id, res.status());
+    let odata: ODataArtifactResponse = get_odata_json(
+        client,
+        token,
+        &config.tenant_id,
+        "IntegrationRuntimeArtifacts",
+        config.artifacts_url(),
+    )
+    .await?;
+    let mut artifacts = odata.d.results;
+    for art in &mut artifacts {
+        art.parsed_deployed_on = clean_sap_date(art.deployed_on.as_deref());
     }
+    Ok(artifacts)
 }
 
 // ─── Erreurs ─────────────────────────────────────────────────────────────────
@@ -311,24 +389,25 @@ pub async fn fetch_artifacts_for_package(
 ) -> Result<Vec<DesigntimeArtifact>> {
     let url = config.package_artifacts_url(package_id);
 
-    let res = client
-        .get(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/json")
-        .send()
-        .await?;
-
-    if res.status().is_success() {
-        let odata: ODataDesignResponse = res.json().await?;
-        Ok(odata.d.results)
-    } else {
-        warn!(
-            "[{}] Échec fetch artifacts pour package {}: HTTP {}",
-            config.tenant_id,
-            package_id,
-            res.status()
-        );
-        Ok(vec![])
+    match get_odata_json::<ODataDesignResponse>(
+        client,
+        token,
+        &config.tenant_id,
+        "IntegrationDesigntimeArtifacts",
+        url,
+    )
+    .await
+    {
+        Ok(odata) => Ok(odata.d.results),
+        Err(e) => {
+            warn!(
+                "[{}] Échec fetch artifacts pour package {}: {:#}",
+                config.tenant_id,
+                package_id,
+                e
+            );
+            Ok(vec![])
+        }
     }
 }
 
@@ -373,23 +452,24 @@ pub async fn fetch_artifact_properties(
 ) -> Result<Vec<ArtifactConfiguration>> {
     let url = config.artifact_configs_url(artifact_id);
 
-    let res = client
-        .get(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/json")
-        .send()
-        .await?;
-
-    if res.status().is_success() {
-        let odata: ODataConfigResponse = res.json().await?;
-        Ok(odata.d.results)
-    } else {
-        warn!(
-            "[{}] Échec fetch configs pour artifact {}: HTTP {}",
-            config.tenant_id,
-            artifact_id,
-            res.status()
-        );
-        Ok(vec![])
+    match get_odata_json::<ODataConfigResponse>(
+        client,
+        token,
+        &config.tenant_id,
+        "Configurations",
+        url,
+    )
+    .await
+    {
+        Ok(odata) => Ok(odata.d.results),
+        Err(e) => {
+            warn!(
+                "[{}] Échec fetch configs pour artifact {}: {:#}",
+                config.tenant_id,
+                artifact_id,
+                e
+            );
+            Ok(vec![])
+        }
     }
 }

@@ -8,7 +8,7 @@ mod tenant_setup;
 mod webhook;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::{SapConfig, TokenCache};
 use futures::stream::{self, StreamExt};
 use models::{ArtifactError, LogEntry};
@@ -16,6 +16,14 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackfillStrategy {
+    /// Pagination classique avec $skip. Tres rapide sur des volumes moyens, mais ralentit quand $skip devient profond.
+    Offset,
+    /// Pagination par curseur temporel: LogStart < derniere date recue. Recommande pour les gros backfills.
+    Cursor,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -28,9 +36,26 @@ struct Cli {
     #[arg(short, long, default_value_t = 1_000)]
     top: u32,
 
-    /// Taille d'une page OData MessageProcessingLogs.
+    /// Taille logique demandée pour une page OData MessageProcessingLogs.
+    /// SAP CPI plafonne souvent silencieusement à 1000 résultats par page.
     #[arg(long, default_value_t = 1_000)]
     page_size: u32,
+
+    /// Nombre de pages MessageProcessingLogs récupérées en parallèle en mode backfill full.
+    /// Garder 1 pour le mode le plus sûr. Monter à 3-6 pour les backfills rapides.
+    #[arg(long, default_value_t = 1)]
+    page_concurrency: usize,
+
+    /// Strategie de backfill full pour les logs.
+    /// offset = $skip classique, rapide sur petits volumes.
+    /// cursor = filtre LogStart < derniere_date_vue, plus stable sur gros volumes.
+    #[arg(long, value_enum, default_value = "offset")]
+    backfill_strategy: BackfillStrategy,
+
+    /// Nombre de logs gardés en mémoire avant un COPY PostgreSQL.
+    /// Plus grand = moins de merges DB, mais plus de RAM utilisée.
+    #[arg(long, default_value_t = 20_000)]
+    insert_buffer_rows: usize,
 
     /// Force une resynchronisation sans filtre incrémental.
     #[arg(long)]
@@ -92,6 +117,11 @@ struct Cli {
     #[arg(long)]
     skip_webhooks: bool,
 
+    /// Ne calcule ni pending_alerts ni smart alerts pendant ce cycle.
+    /// Recommandé pour les backfills massifs et les benchmarks d ingestion.
+    #[arg(long)]
+    skip_alerts: bool,
+
     /// N'appelle pas ErrorInformation/$value pour chaque MPL FAILED.
     /// Utile pour des backfills massifs où le débit prime sur le détail.
     #[arg(long)]
@@ -118,6 +148,9 @@ struct Cli {
 struct SyncOptions {
     top: u32,
     page_size: u32,
+    page_concurrency: usize,
+    backfill_strategy: BackfillStrategy,
+    insert_buffer_rows: usize,
     full: bool,
     log_concurrency: usize,
     metadata_concurrency: usize,
@@ -126,6 +159,7 @@ struct SyncOptions {
     metadata_only: bool,
     skip_configs: bool,
     fetch_error_details: bool,
+    queue_alerts: bool,
     alert_scan_limit: usize,
 }
 
@@ -135,6 +169,9 @@ impl From<&Cli> for SyncOptions {
         Self {
             top,
             page_size: cli.page_size.clamp(1, 5_000).min(top),
+            page_concurrency: cli.page_concurrency.max(1).min(16),
+            backfill_strategy: cli.backfill_strategy,
+            insert_buffer_rows: cli.insert_buffer_rows.clamp(1_000, 200_000),
             full: cli.full,
             log_concurrency: cli.log_concurrency.max(1),
             metadata_concurrency: cli.metadata_concurrency.max(1),
@@ -143,6 +180,7 @@ impl From<&Cli> for SyncOptions {
             metadata_only: cli.metadata_only,
             skip_configs: cli.skip_configs,
             fetch_error_details: !cli.skip_error_details,
+            queue_alerts: !cli.skip_alerts && cli.alert_scan_limit > 0,
             alert_scan_limit: cli.alert_scan_limit,
         }
     }
@@ -474,24 +512,321 @@ async fn sync_logs(
         None
     };
 
-    let logs = api::fetch_sap_logs_paged(
-        client,
-        token,
-        sap_config,
-        opts.top,
-        opts.page_size,
-        filter.as_deref(),
-        opts.log_concurrency,
-        opts.fetch_error_details,
-    )
-    .await?;
+    if !incremental && filter.is_none() {
+        match opts.backfill_strategy {
+            BackfillStrategy::Cursor => {
+                sync_logs_cursor_backfill(pool, client, sap_config, token, opts).await
+            }
+            BackfillStrategy::Offset if opts.page_concurrency > 1 => {
+                sync_logs_parallel_backfill(pool, client, sap_config, token, opts).await
+            }
+            BackfillStrategy::Offset => {
+                sync_logs_sequential_buffered(pool, client, sap_config, token, opts, None).await
+            }
+        }
+    } else {
+        // En incremental, on garde le chemin sequentiel avec filtre LogStart gt dernier log connu.
+        sync_logs_sequential_buffered(pool, client, sap_config, token, opts, filter.as_deref())
+            .await
+    }
+}
 
-    let count = logs.len();
-    let queued =
-        queue_exec_alerts_from_logs(pool, &sap_config.tenant_id, &logs, opts.alert_scan_limit)
+async fn sync_logs_sequential_buffered(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    sap_config: &SapConfig,
+    token: &str,
+    opts: &SyncOptions,
+    filter: Option<&str>,
+) -> Result<(usize, usize)> {
+    let mut total_logs = 0usize;
+    let mut total_alerts = 0usize;
+    let mut skip = 0u32;
+    let mut buffer: Vec<LogEntry> =
+        Vec::with_capacity(opts.insert_buffer_rows.min(opts.top as usize));
+
+    while skip < opts.top {
+        let wanted = (opts.top - skip).min(opts.page_size);
+        let logs = api::fetch_sap_logs_page(
+            client,
+            token,
+            sap_config,
+            wanted,
+            skip,
+            filter,
+            opts.log_concurrency,
+            opts.fetch_error_details,
+        )
+        .await?;
+
+        let fetched = logs.len();
+        if fetched == 0 {
+            break;
+        }
+
+        if opts.queue_alerts && total_alerts < opts.alert_scan_limit {
+            total_alerts += queue_exec_alerts_from_logs(
+                pool,
+                &sap_config.tenant_id,
+                &logs,
+                opts.alert_scan_limit.saturating_sub(total_alerts),
+            )
             .await?;
-    db::insert_logs(pool, &sap_config.tenant_id, logs).await?;
-    Ok((count, queued))
+        }
+
+        buffer.extend(logs);
+        if buffer.len() >= opts.insert_buffer_rows {
+            db::insert_logs(pool, &sap_config.tenant_id, std::mem::take(&mut buffer)).await?;
+        }
+
+        total_logs += fetched;
+
+        log::info!(
+            "[{}] logs page OK: fetched={} total={} skip_next={}",
+            sap_config.tenant_id,
+            fetched,
+            total_logs,
+            skip.saturating_add(fetched as u32)
+        );
+
+        // SAP CPI peut limiter une page à 1000 lignes même si on demande 5000.
+        // Ne pas stopper sur `fetched < wanted`, sinon `--top 50000 --page-size 5000`
+        // s'arrête à 1000. On continue avec `$skip += fetched` jusqu'à `top` ou page vide.
+        skip = skip.saturating_add(fetched as u32);
+    }
+
+    if !buffer.is_empty() {
+        db::insert_logs(pool, &sap_config.tenant_id, buffer).await?;
+    }
+
+    Ok((total_logs, total_alerts))
+}
+
+async fn sync_logs_cursor_backfill(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    sap_config: &SapConfig,
+    token: &str,
+    opts: &SyncOptions,
+) -> Result<(usize, usize)> {
+    // Cette strategie evite les `$skip` profonds.
+    // Au lieu de demander `skip=250000`, elle demande toujours la premiere page
+    // des logs plus anciens que le plus vieux LogStart deja recu.
+    let effective_page_size = opts.page_size.min(1_000).max(1);
+    let mut total_logs = 0usize;
+    let mut total_alerts = 0usize;
+    let mut cursor: Option<chrono::NaiveDateTime> = None;
+    let mut buffer: Vec<LogEntry> =
+        Vec::with_capacity(opts.insert_buffer_rows.min(opts.top as usize));
+
+    log::info!(
+        "[{}] backfill cursor: page_size={} insert_buffer_rows={} top={}",
+        sap_config.tenant_id,
+        effective_page_size,
+        opts.insert_buffer_rows,
+        opts.top
+    );
+
+    while total_logs < opts.top as usize {
+        let remaining = (opts.top as usize).saturating_sub(total_logs);
+        let wanted = effective_page_size.min(remaining as u32);
+        let filter =
+            cursor.map(|dt| format!("LogStart lt datetime'{}'", format_odata_datetime(dt)));
+
+        let logs = api::fetch_sap_logs_page(
+            client,
+            token,
+            sap_config,
+            wanted,
+            0,
+            filter.as_deref(),
+            opts.log_concurrency,
+            opts.fetch_error_details,
+        )
+        .await?;
+
+        let fetched = logs.len();
+        if fetched == 0 {
+            break;
+        }
+
+        let oldest = logs.iter().filter_map(|log| log.parsed_date).min();
+
+        if opts.queue_alerts && total_alerts < opts.alert_scan_limit {
+            total_alerts += queue_exec_alerts_from_logs(
+                pool,
+                &sap_config.tenant_id,
+                &logs,
+                opts.alert_scan_limit.saturating_sub(total_alerts),
+            )
+            .await?;
+        }
+
+        buffer.extend(logs);
+        total_logs += fetched;
+
+        log::info!(
+            "[{}] logs cursor page OK: fetched={} total={} next_before={}",
+            sap_config.tenant_id,
+            fetched,
+            total_logs,
+            oldest
+                .map(format_odata_datetime)
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+
+        if buffer.len() >= opts.insert_buffer_rows {
+            db::insert_logs(pool, &sap_config.tenant_id, std::mem::take(&mut buffer)).await?;
+        }
+
+        let Some(oldest) = oldest else {
+            log::warn!(
+                "[{}] backfill cursor stoppe: aucune parsed_date dans la derniere page",
+                sap_config.tenant_id
+            );
+            break;
+        };
+
+        if cursor == Some(oldest) {
+            log::warn!(
+                "[{}] backfill cursor stoppe: curseur bloque sur {}",
+                sap_config.tenant_id,
+                format_odata_datetime(oldest)
+            );
+            break;
+        }
+
+        cursor = Some(oldest);
+
+        if fetched < wanted as usize {
+            break;
+        }
+    }
+
+    if !buffer.is_empty() {
+        db::insert_logs(pool, &sap_config.tenant_id, buffer).await?;
+    }
+
+    Ok((total_logs, total_alerts))
+}
+
+fn format_odata_datetime(dt: chrono::NaiveDateTime) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+async fn sync_logs_parallel_backfill(
+    pool: &sqlx::PgPool,
+    client: &reqwest::Client,
+    sap_config: &SapConfig,
+    token: &str,
+    opts: &SyncOptions,
+) -> Result<(usize, usize)> {
+    // Important: SAP CPI renvoie souvent 1000 lignes maximum même si `$top=5000`.
+    // En parallèle, `$skip` est pré-calculé: il faut donc utiliser un stride fiable.
+    let sap_page_stride = opts.page_size.min(1_000).max(1);
+    let mut next_skip = 0u32;
+    let mut total_logs = 0usize;
+    let mut total_alerts = 0usize;
+    let mut stop = false;
+    let mut buffer: Vec<LogEntry> =
+        Vec::with_capacity(opts.insert_buffer_rows.min(opts.top as usize));
+
+    log::info!(
+        "[{}] backfill parallèle: page_concurrency={} sap_page_stride={} insert_buffer_rows={}",
+        sap_config.tenant_id,
+        opts.page_concurrency,
+        sap_page_stride,
+        opts.insert_buffer_rows
+    );
+
+    while next_skip < opts.top && !stop {
+        let mut offsets = Vec::with_capacity(opts.page_concurrency);
+        for _ in 0..opts.page_concurrency {
+            if next_skip >= opts.top {
+                break;
+            }
+            let wanted = (opts.top - next_skip).min(sap_page_stride);
+            offsets.push((next_skip, wanted));
+            next_skip = next_skip.saturating_add(wanted);
+        }
+
+        let mut pages: Vec<Result<(u32, u32, Vec<LogEntry>)>> = stream::iter(offsets.into_iter())
+            .map(|(skip, wanted)| {
+                let client = client.clone();
+                let token = token.to_string();
+                let cfg = sap_config.clone();
+                let opts = opts.clone();
+                async move {
+                    let logs = api::fetch_sap_logs_page(
+                        &client,
+                        &token,
+                        &cfg,
+                        wanted,
+                        skip,
+                        None,
+                        opts.log_concurrency,
+                        opts.fetch_error_details,
+                    )
+                    .await?;
+                    Ok((skip, wanted, logs))
+                }
+            })
+            .buffer_unordered(opts.page_concurrency)
+            .collect()
+            .await;
+
+        pages.sort_by_key(|res| match res {
+            Ok((skip, _, _)) => *skip,
+            Err(_) => u32::MAX,
+        });
+
+        for page in pages {
+            let (skip, wanted, logs) = page?;
+            let fetched = logs.len();
+
+            if fetched == 0 {
+                stop = true;
+                continue;
+            }
+
+            if opts.queue_alerts && total_alerts < opts.alert_scan_limit {
+                total_alerts += queue_exec_alerts_from_logs(
+                    pool,
+                    &sap_config.tenant_id,
+                    &logs,
+                    opts.alert_scan_limit.saturating_sub(total_alerts),
+                )
+                .await?;
+            }
+
+            buffer.extend(logs);
+            total_logs += fetched;
+
+            log::info!(
+                "[{}] logs page OK: fetched={} total={} skip_next={}",
+                sap_config.tenant_id,
+                fetched,
+                total_logs,
+                skip.saturating_add(fetched as u32)
+            );
+
+            if buffer.len() >= opts.insert_buffer_rows {
+                db::insert_logs(pool, &sap_config.tenant_id, std::mem::take(&mut buffer)).await?;
+            }
+
+            // Ici `wanted` vaut au plus `sap_page_stride`, donc `fetched < wanted` est un vrai signal
+            // de fin de collection. Ce n'est pas le cas en séquentiel avec page_size=5000.
+            if fetched < wanted as usize || total_logs >= opts.top as usize {
+                stop = true;
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        db::insert_logs(pool, &sap_config.tenant_id, buffer).await?;
+    }
+
+    Ok((total_logs, total_alerts))
 }
 
 async fn queue_exec_alerts_from_logs(
@@ -572,6 +907,7 @@ async fn sync_packages_artifacts_and_configs(
         token,
         error_ids,
         opts.metadata_concurrency,
+        opts.queue_alerts,
     )
     .await?;
 
@@ -597,6 +933,7 @@ async fn sync_artifact_errors(
     token: &str,
     error_ids: Vec<String>,
     concurrency: usize,
+    queue_alerts: bool,
 ) -> Result<usize> {
     let results: Vec<Result<usize>> = stream::iter(error_ids.into_iter())
         .map(|id| {
@@ -618,15 +955,17 @@ async fn sync_artifact_errors(
                             },
                         )
                         .await?;
-                        db::insert_pending_alert(
-                            &pool,
-                            &sap_config.tenant_id,
-                            &id,
-                            &id,
-                            "deploy",
-                            &snippet,
-                        )
-                        .await?;
+                        if queue_alerts {
+                            db::insert_pending_alert(
+                                &pool,
+                                &sap_config.tenant_id,
+                                &id,
+                                &id,
+                                "deploy",
+                                &snippet,
+                            )
+                            .await?;
+                        }
                         Ok(1)
                     }
                     None => Ok(0),
