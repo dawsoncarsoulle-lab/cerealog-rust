@@ -65,7 +65,10 @@ impl SapConfig {
     }
 
     pub fn artifacts_url(&self) -> String {
-        format!("{}/api/v1/IntegrationRuntimeArtifacts?$format=json", self.base_url)
+        format!(
+            "{}/api/v1/IntegrationRuntimeArtifacts?$format=json",
+            self.base_url
+        )
     }
 
     pub fn logs_url(&self, top: u32, filter: Option<&str>) -> String {
@@ -103,7 +106,8 @@ impl SapConfig {
     pub fn package_artifacts_url(&self, package_id: &str) -> String {
         format!(
             "{}/api/v1/IntegrationPackages('{}')/IntegrationDesigntimeArtifacts?$format=json",
-            self.base_url, escape_odata_string_literal(package_id)
+            self.base_url,
+            escape_odata_string_literal(package_id)
         )
     }
 

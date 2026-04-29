@@ -93,9 +93,33 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     log_concurrency: usize,
 
-    /// Requêtes concurrentes packages/artifacts/configurations.
-    #[arg(long, default_value_t = 32)]
+    /// Requêtes concurrentes packages/artifacts.
+    /// Par défaut proche du full refresh TUI historique: rapide, mais peut générer des 429 sur certains endpoints SAP.
+    #[arg(long, default_value_t = 20)]
     metadata_concurrency: usize,
+
+    /// Requêtes concurrentes pour les Configurations SAP.
+    /// Par défaut rapide, proche du TUI historique. Pour un mode anti-429 fiable, utiliser --config-concurrency 1 --config-retries 6 --config-delay-ms 250.
+    #[arg(long, default_value_t = 20)]
+    config_concurrency: usize,
+
+    /// Nombre de retries sur HTTP 429 pour les endpoints metadata/configurations.
+    /// 0 par défaut pour garder un full refresh rapide. Monter à 6 en mode extraction complète fiable.
+    #[arg(long, default_value_t = 0)]
+    config_retries: usize,
+
+    /// Delai initial du backoff 429 pour les configs, en millisecondes.
+    #[arg(long, default_value_t = 1_000)]
+    config_retry_base_ms: u64,
+
+    /// Delai maximum du backoff 429 pour les configs, en millisecondes.
+    #[arg(long, default_value_t = 30_000)]
+    config_retry_max_ms: u64,
+
+    /// Pause volontaire entre deux appels Configurations par worker, en millisecondes.
+    /// 0 par défaut pour rester proche du TUI historique.
+    #[arg(long, default_value_t = 0)]
+    config_delay_ms: u64,
 
     /// Tenants synchronisés en parallèle. 0 = tous les tenants actifs.
     #[arg(long, default_value_t = 0)]
@@ -154,6 +178,11 @@ struct SyncOptions {
     full: bool,
     log_concurrency: usize,
     metadata_concurrency: usize,
+    config_concurrency: usize,
+    config_retries: usize,
+    config_retry_base_ms: u64,
+    config_retry_max_ms: u64,
+    config_delay_ms: u64,
     tenant_concurrency: usize,
     logs_only: bool,
     metadata_only: bool,
@@ -169,12 +198,19 @@ impl From<&Cli> for SyncOptions {
         Self {
             top,
             page_size: cli.page_size.clamp(1, 5_000).min(top),
-            page_concurrency: cli.page_concurrency.max(1).min(16),
+            page_concurrency: cli.page_concurrency.clamp(1, 16),
             backfill_strategy: cli.backfill_strategy,
             insert_buffer_rows: cli.insert_buffer_rows.clamp(1_000, 200_000),
             full: cli.full,
             log_concurrency: cli.log_concurrency.max(1),
-            metadata_concurrency: cli.metadata_concurrency.max(1),
+            metadata_concurrency: cli.metadata_concurrency.clamp(1, 64),
+            config_concurrency: cli.config_concurrency.clamp(1, 64),
+            config_retries: cli.config_retries,
+            config_retry_base_ms: cli.config_retry_base_ms.max(100),
+            config_retry_max_ms: cli
+                .config_retry_max_ms
+                .max(cli.config_retry_base_ms.max(100)),
+            config_delay_ms: cli.config_delay_ms,
             tenant_concurrency: cli.tenant_concurrency,
             logs_only: cli.logs_only,
             metadata_only: cli.metadata_only,
@@ -216,6 +252,8 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     init_logger();
 
+    let launched_without_args = std::env::args_os().len() == 1;
+
     let cli = Cli::parse();
 
     let db_url = std::env::var("DATABASE_URL").context("DATABASE_URL manquante")?;
@@ -254,7 +292,17 @@ async fn main() -> Result<()> {
     }
 
     let runtimes = init_tenant_runtimes(&client, configs).await?;
-    let opts = SyncOptions::from(&cli);
+    let mut opts = SyncOptions::from(&cli);
+
+    if launched_without_args {
+        opts.full = true;
+        opts.logs_only = false;
+        opts.metadata_only = false;
+        opts.skip_configs = false;
+        opts.fetch_error_details = true;
+        opts.queue_alerts = cli.alert_scan_limit > 0;
+        log::info!("Aucun argument fourni: lancement en full refresh complet rapide par defaut.");
+    }
 
     if cli.daemon && !cli.once {
         run_daemon(pool, client, runtimes, opts, &cli).await
@@ -612,7 +660,7 @@ async fn sync_logs_cursor_backfill(
     // Cette strategie evite les `$skip` profonds.
     // Au lieu de demander `skip=250000`, elle demande toujours la premiere page
     // des logs plus anciens que le plus vieux LogStart deja recu.
-    let effective_page_size = opts.page_size.min(1_000).max(1);
+    let effective_page_size = opts.page_size.clamp(1, 1_000);
     let mut total_logs = 0usize;
     let mut total_alerts = 0usize;
     let mut cursor: Option<chrono::NaiveDateTime> = None;
@@ -723,7 +771,7 @@ async fn sync_logs_parallel_backfill(
 ) -> Result<(usize, usize)> {
     // Important: SAP CPI renvoie souvent 1000 lignes maximum même si `$top=5000`.
     // En parallèle, `$skip` est pré-calculé: il faut donc utiliser un stride fiable.
-    let sap_page_stride = opts.page_size.min(1_000).max(1);
+    let sap_page_stride = opts.page_size.clamp(1, 1_000);
     let mut next_skip = 0u32;
     let mut total_logs = 0usize;
     let mut total_alerts = 0usize;
@@ -912,15 +960,8 @@ async fn sync_packages_artifacts_and_configs(
     .await?;
 
     if !opts.skip_configs && !pkg_ids.is_empty() {
-        report.configs = sync_configurations(
-            pool,
-            client,
-            sap_config,
-            token,
-            &pkg_ids,
-            opts.metadata_concurrency,
-        )
-        .await?;
+        report.configs =
+            sync_configurations(pool, client, sap_config, token, &pkg_ids, opts).await?;
     }
 
     Ok(report)
@@ -989,10 +1030,19 @@ async fn sync_configurations(
     sap_config: &SapConfig,
     token: &str,
     pkg_ids: &[String],
-    concurrency: usize,
+    opts: &SyncOptions,
 ) -> Result<usize> {
-    let mapping =
-        api::fetch_all_package_artifacts(client, token, sap_config, pkg_ids, concurrency).await;
+    let mapping = api::fetch_all_package_artifacts_with_retry(
+        client,
+        token,
+        sap_config,
+        pkg_ids,
+        opts.metadata_concurrency.max(1),
+        opts.config_retries,
+        opts.config_retry_base_ms,
+        opts.config_retry_max_ms,
+    )
+    .await;
 
     let pairs: Vec<(String, String)> = mapping
         .iter()
@@ -1001,6 +1051,10 @@ async fn sync_configurations(
     db::bulk_update_artifact_package(pool, &pairs).await?;
 
     let all_art_ids: Vec<String> = mapping.into_values().flatten().collect();
+    let config_retries = opts.config_retries;
+    let config_retry_base_ms = opts.config_retry_base_ms;
+    let config_retry_max_ms = opts.config_retry_max_ms;
+    let config_delay_ms = opts.config_delay_ms;
     let results: Vec<Result<usize>> = stream::iter(all_art_ids.into_iter())
         .map(|art_id| {
             let pool = pool.clone();
@@ -1008,14 +1062,25 @@ async fn sync_configurations(
             let token = token.to_string();
             let sap_config = sap_config.clone();
             async move {
-                let cfgs =
-                    api::fetch_artifact_properties(&client, &token, &sap_config, &art_id).await?;
+                if config_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(config_delay_ms)).await;
+                }
+                let cfgs = api::fetch_artifact_properties_with_retry(
+                    &client,
+                    &token,
+                    &sap_config,
+                    &art_id,
+                    config_retries,
+                    config_retry_base_ms,
+                    config_retry_max_ms,
+                )
+                .await?;
                 let count = cfgs.len();
                 db::insert_configurations(&pool, &sap_config.tenant_id, &art_id, cfgs).await?;
                 Ok(count)
             }
         })
-        .buffer_unordered(concurrency.max(1))
+        .buffer_unordered(opts.config_concurrency.max(1))
         .collect()
         .await;
 

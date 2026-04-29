@@ -49,5 +49,5 @@ pub fn decrypt(encoded: &str) -> Result<String> {
         .decrypt(nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("Déchiffrement échoué: {}", e))?;
 
-    Ok(String::from_utf8(plaintext).context("UTF-8 invalide")?)
+    String::from_utf8(plaintext).context("UTF-8 invalide")
 }

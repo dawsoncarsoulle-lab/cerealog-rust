@@ -1,8 +1,11 @@
 .env
 .env.*
+.venv
 .secrets/
 /target
 update.md
 tmp.md
 install.sh
 SAP_BTP_Monitor_Documentation.docx
+table.sql
+DAEMON_USAGE.md

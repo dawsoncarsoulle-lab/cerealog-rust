@@ -1,10 +1,10 @@
 use crate::config::{SapConfig, TokenCache};
 use crate::models::{DesigntimeArtifact, ODataDesignResponse};
 use anyhow::{Context, Result};
-use serde::de::DeserializeOwned;
 use chrono::{DateTime, NaiveDateTime};
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
+use serde::de::DeserializeOwned;
 
 use crate::models::{
     ArtifactConfiguration, IntegrationPackage, LogEntry, ODataArtifactResponse,
@@ -61,8 +61,7 @@ fn body_snippet(body: &str) -> String {
         .chars()
         .take(600)
         .collect::<String>()
-        .replace('\n', " ")
-        .replace('\r', " ");
+        .replace(['\n', '\r'], " ");
     if body.chars().count() > 600 {
         format!("{}…", compact)
     } else {
@@ -80,51 +79,111 @@ async fn get_odata_json<T>(
 where
     T: DeserializeOwned,
 {
-    let res = client
-        .get(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/json")
-        .header("DataServiceVersion", "2.0")
-        .header("MaxDataServiceVersion", "2.0")
-        .send()
-        .await
-        .with_context(|| format!("[{}] requête {} échouée: {}", tenant_id, label, url))?;
+    get_odata_json_with_retry(
+        client,
+        token,
+        tenant_id,
+        label,
+        url,
+        0,
+        std::time::Duration::from_millis(0),
+        std::time::Duration::from_millis(0),
+    )
+    .await
+}
 
-    let status = res.status();
-    let content_type = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<absent>")
-        .to_string();
-    let body = res
-        .text()
-        .await
-        .with_context(|| format!("[{}] lecture body {} impossible", tenant_id, label))?;
+async fn get_odata_json_with_retry<T>(
+    client: &reqwest::Client,
+    token: &str,
+    tenant_id: &str,
+    label: &str,
+    url: String,
+    max_retries: usize,
+    base_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let mut attempt = 0usize;
 
-    if !status.is_success() {
-        anyhow::bail!(
-            "[{}] {} HTTP {} content-type={} url={} body={}",
-            tenant_id,
-            label,
-            status,
-            content_type,
-            url,
-            body_snippet(&body)
-        );
+    loop {
+        let res = client
+            .get(&url)
+            .bearer_auth(token)
+            .header("Accept", "application/json")
+            .header("DataServiceVersion", "2.0")
+            .header("MaxDataServiceVersion", "2.0")
+            .send()
+            .await
+            .with_context(|| format!("[{}] requête {} échouée: {}", tenant_id, label, url))?;
+
+        let status = res.status();
+        let retry_after_secs = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<absent>")
+            .to_string();
+        let body = res
+            .text()
+            .await
+            .with_context(|| format!("[{}] lecture body {} impossible", tenant_id, label))?;
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < max_retries {
+            let delay = retry_after_secs
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| {
+                    let factor = 1u32.checked_shl(attempt.min(10) as u32).unwrap_or(1024);
+                    let mut d = base_delay.saturating_mul(factor);
+                    if max_delay > std::time::Duration::ZERO && d > max_delay {
+                        d = max_delay;
+                    }
+                    d
+                });
+
+            log::warn!(
+                "[{}] {} HTTP 429, retry {}/{} dans {}ms",
+                tenant_id,
+                label,
+                attempt + 1,
+                max_retries,
+                delay.as_millis()
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+            continue;
+        }
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "[{}] {} HTTP {} content-type={} url={} body={}",
+                tenant_id,
+                label,
+                status,
+                content_type,
+                url,
+                body_snippet(&body)
+            );
+        }
+
+        return serde_json::from_str::<T>(&body).with_context(|| {
+            format!(
+                "[{}] réponse {} non-JSON ou format inattendu: HTTP {} content-type={} url={} body={}",
+                tenant_id,
+                label,
+                status,
+                content_type,
+                url,
+                body_snippet(&body)
+            )
+        });
     }
-
-    serde_json::from_str::<T>(&body).with_context(|| {
-        format!(
-            "[{}] réponse {} non-JSON ou format inattendu: HTTP {} content-type={} url={} body={}",
-            tenant_id,
-            label,
-            status,
-            content_type,
-            url,
-            body_snippet(&body)
-        )
-    })
 }
 
 // ─── Token OAuth ─────────────────────────────────────────────────────────────
@@ -402,9 +461,7 @@ pub async fn fetch_artifacts_for_package(
         Err(e) => {
             warn!(
                 "[{}] Échec fetch artifacts pour package {}: {:#}",
-                config.tenant_id,
-                package_id,
-                e
+                config.tenant_id, package_id, e
             );
             Ok(vec![])
         }
@@ -444,6 +501,81 @@ pub async fn fetch_all_package_artifacts(
 
 // ─── Configurations ──────────────────────────────────────────────────────────
 
+pub async fn fetch_artifacts_for_package_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    config: &SapConfig,
+    package_id: &str,
+    max_retries: usize,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+) -> Result<Vec<DesigntimeArtifact>> {
+    let url = config.package_artifacts_url(package_id);
+
+    match get_odata_json_with_retry::<ODataDesignResponse>(
+        client,
+        token,
+        &config.tenant_id,
+        "IntegrationDesigntimeArtifacts",
+        url,
+        max_retries,
+        std::time::Duration::from_millis(retry_base_ms),
+        std::time::Duration::from_millis(retry_max_ms),
+    )
+    .await
+    {
+        Ok(odata) => Ok(odata.d.results),
+        Err(e) => {
+            warn!(
+                "[{}] Echec fetch artifacts pour package {} apres retry: {:#}",
+                config.tenant_id, package_id, e
+            );
+            Ok(vec![])
+        }
+    }
+}
+
+pub async fn fetch_all_package_artifacts_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    config: &SapConfig,
+    package_ids: &[String],
+    concurrency: usize,
+    max_retries: usize,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let results: Vec<(String, Vec<String>)> = stream::iter(package_ids.iter().cloned())
+        .map(|pkg_id| {
+            let client = client.clone();
+            let token = token.to_string();
+            let cfg = config.clone();
+            async move {
+                let arts = fetch_artifacts_for_package_with_retry(
+                    &client,
+                    &token,
+                    &cfg,
+                    &pkg_id,
+                    max_retries,
+                    retry_base_ms,
+                    retry_max_ms,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Erreur fetch package {}: {}", pkg_id, e);
+                    vec![]
+                });
+
+                let ids = arts.into_iter().filter_map(|a| a.id).collect();
+                (pkg_id, ids)
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+
+    results.into_iter().collect()
+}
 pub async fn fetch_artifact_properties(
     client: &reqwest::Client,
     token: &str,
@@ -465,9 +597,41 @@ pub async fn fetch_artifact_properties(
         Err(e) => {
             warn!(
                 "[{}] Échec fetch configs pour artifact {}: {:#}",
-                config.tenant_id,
-                artifact_id,
-                e
+                config.tenant_id, artifact_id, e
+            );
+            Ok(vec![])
+        }
+    }
+}
+
+pub async fn fetch_artifact_properties_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    config: &SapConfig,
+    artifact_id: &str,
+    max_retries: usize,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+) -> Result<Vec<ArtifactConfiguration>> {
+    let url = config.artifact_configs_url(artifact_id);
+
+    match get_odata_json_with_retry::<ODataConfigResponse>(
+        client,
+        token,
+        &config.tenant_id,
+        "Configurations",
+        url,
+        max_retries,
+        std::time::Duration::from_millis(retry_base_ms),
+        std::time::Duration::from_millis(retry_max_ms),
+    )
+    .await
+    {
+        Ok(odata) => Ok(odata.d.results),
+        Err(e) => {
+            warn!(
+                "[{}] Échec fetch configs pour artifact {} après retry: {:#}",
+                config.tenant_id, artifact_id, e
             );
             Ok(vec![])
         }

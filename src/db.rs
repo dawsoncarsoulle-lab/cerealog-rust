@@ -62,7 +62,10 @@ async fn insert_logs_copy_batch(
         copy_payload.push('\n');
     }
 
-    let mut conn = pool.acquire().await.context("acquisition connexion PostgreSQL")?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquisition connexion PostgreSQL")?;
 
     sqlx::query("BEGIN")
         .execute(&mut *conn)
@@ -88,7 +91,7 @@ async fn insert_logs_copy_batch(
             (message_guid, status, parsed_date, error_message, integration_flow_name, tenant_id) \
             FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL '\\N')";
 
-        let mut copy = (&mut *conn)
+        let mut copy = (conn)
             .copy_in_raw(copy_sql)
             .await
             .context("démarrage COPY tmp_sap_monitoring_logs")?;
