@@ -1,37 +1,15 @@
 [package]
-name = "sap-extractor"
-version = "0.3.0"
+name = "cerealog-tui"
+version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 anyhow = "1.0"
-log = "0.4"
-env_logger = "0.10"
-dotenvy = "0.15"
-chrono = { version = "0.4", features = ["clock"] }
-regex = "1.10"
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono","json"] }
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
-indicatif = "0.17"
-ratatui = "0.26"
 crossterm = "0.27"
-futures = "0.3"
-aes-gcm = "0.10"
-base64 = "0.22"
-rand = "0.8"
-hex = "0.4"
-rpassword = "7"
-
-# Persistance de la config utilisateur
-dirs = "5"
-toml = "0.8"
-
-[dependencies.indexmap]
-version = "=2.2.6"
-
-[dependencies.home]
-version = "=0.5.9"
+dotenvy = "0.15"
+ratatui = "0.26"
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono", "json"] }
+tokio = { version = "1", features = ["full"] }

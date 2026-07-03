@@ -1,391 +1,710 @@
-use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
-use crate::models::{RefreshData, Stats};
 use anyhow::Result;
-use sqlx::Row;
-use std::collections::HashMap;
+use sqlx::PgPool;
 
-/// Construit le payload complet de rafraîchissement.
-pub async fn build_refresh_data(pool: &sqlx::PgPool, logs_limit: u32) -> Result<RefreshData> {
+use crate::models::{
+    AlertData, ArtifactRow, ConfigurationRow, DataSet, ErrorRow, LogRow, OverviewStats, PackageRow,
+    PendingAlertRow, SmartAlertRow, Tenant,
+};
+
+const LEGACY_TENANT_ID: &str = "cerealog";
+
+pub async fn load_dataset(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<DataSet> {
+    let search = normalize_search(search);
     let (
-        logs_res,
-        exec_errors_res,
-        active_exec_errors_res,
-        artifacts_res,
-        packages_res,
-        deploy_errors_res,
-        configs_res,
-        stats_res,
-        hourly_res,
-        daily_res,
-        activity_res,
-        top_errors_res,
-        log_st_res,
-        art_st_res,
-    ) = tokio::join!(
-        fetch_logs(pool, logs_limit),
-        fetch_exec_errors(pool),
-        fetch_active_exec_errors(pool),
-        fetch_artifacts(pool),
-        fetch_packages(pool),
-        fetch_deploy_errors(pool),
-        fetch_all_configs(pool),
-        fetch_stats(pool),
-        fetch_hourly_errors(pool),
-        fetch_daily_errors(pool),
-        fetch_activity(pool),
-        fetch_top_errors(pool),
-        fetch_log_statuses(pool),
-        fetch_artifact_statuses(pool),
-    );
+        tenants,
+        stats,
+        recent_logs,
+        logs,
+        packages,
+        artifacts,
+        errors,
+        configurations,
+        pending_alerts,
+        smart_alerts,
+    ) = tokio::try_join!(
+        fetch_active_tenants(pool),
+        fetch_overview_stats(pool, tenant),
+        fetch_recent_logs(pool, tenant, search.as_deref(), 10),
+        fetch_logs(pool, tenant, search.as_deref(), limit),
+        fetch_packages(pool, tenant, search.as_deref(), limit),
+        fetch_artifacts(pool, tenant, search.as_deref(), limit),
+        fetch_errors(pool, tenant, search.as_deref(), limit),
+        fetch_configurations(pool, tenant, search.as_deref(), limit),
+        fetch_pending_alerts(pool, tenant, search.as_deref(), limit),
+        fetch_smart_alerts(pool, tenant, search.as_deref(), limit),
+    )?;
 
-    let mut all_statuses: HashMap<String, u64> = HashMap::new();
-    for (s, c) in log_st_res? {
-        *all_statuses.entry(s).or_insert(0) += c as u64;
-    }
-    for (s, c) in art_st_res? {
-        *all_statuses.entry(s).or_insert(0) += c as u64;
-    }
-
-    Ok(RefreshData {
-        logs: logs_res?,
-        exec_errors: exec_errors_res?,
-        active_exec_errors: active_exec_errors_res?,
-        artifacts: artifacts_res?,
-        packages: packages_res?,
-        deploy_errors: deploy_errors_res?,
-        configs: configs_res?,
-        stats: stats_res?,
-        error_sparkline: hourly_res?,
-        error_barchart: daily_res?,
-        activity_sparkline: activity_res?,
-        top_errors_barchart: top_errors_res?,
-        status_counts: all_statuses.into_iter().collect(),
+    Ok(DataSet {
+        tenants,
+        stats,
+        recent_logs,
+        logs,
+        packages,
+        artifacts,
+        errors,
+        configurations,
+        alerts: AlertData {
+            pending: pending_alerts,
+            smart: smart_alerts,
+        },
     })
 }
 
-// ─── Requêtes individuelles ───────────────────────────────────────────────────
-
-async fn fetch_logs(pool: &sqlx::PgPool, limit: u32) -> Result<Vec<LogView>> {
-    let rows = sqlx::query_as(
-        "SELECT status, parsed_date, error_message, message_guid, integration_flow_name, tenant_id
-         FROM sap_monitoring_logs
-         ORDER BY parsed_date DESC NULLS LAST
-         LIMIT $1",
-    )
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-/// MPL FAILED uniquement
-pub async fn fetch_exec_errors(pool: &sqlx::PgPool) -> Result<Vec<LogView>> {
-    let rows = sqlx::query_as(
-        "SELECT status, parsed_date, error_message, message_guid, integration_flow_name, tenant_id
-         FROM sap_monitoring_logs
-         WHERE status = 'FAILED'
-         ORDER BY parsed_date DESC NULLS LAST
-         LIMIT 200",
+pub async fn fetch_active_tenants(pool: &PgPool) -> Result<Vec<Tenant>> {
+    Ok(sqlx::query_as::<_, Tenant>(
+        "SELECT id, name, client_name, shared_tenant, active, created_at
+         FROM tenants
+         WHERE active = true
+         ORDER BY id",
     )
     .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    .await?)
 }
 
-async fn fetch_artifacts(pool: &sqlx::PgPool) -> Result<Vec<ArtifactView>> {
-    let rows = sqlx::query_as(
-        "SELECT id, package_id, name, status, deployed_on, tenant_id
-         FROM runtime_artifacts
-         ORDER BY name ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+async fn fetch_overview_stats(pool: &PgPool, tenant: Option<&str>) -> Result<OverviewStats> {
+    Ok(OverviewStats {
+        active_tenants: count_active_tenants(pool, tenant).await?,
+        total_logs: count_rows(pool, "sap_monitoring_logs", tenant, None).await?,
+        failed_logs: count_rows(pool, "sap_monitoring_logs", tenant, Some("FAILED")).await?,
+        completed_logs: count_rows(pool, "sap_monitoring_logs", tenant, Some("COMPLETED")).await?,
+        total_packages: count_rows(pool, "integration_packages", tenant, None).await?,
+        total_artifacts: count_rows(pool, "runtime_artifacts", tenant, None).await?,
+        pending_alerts: count_rows(pool, "pending_alerts", tenant, None).await?,
+    })
 }
 
-async fn fetch_packages(pool: &sqlx::PgPool) -> Result<Vec<PackageView>> {
-    let rows = sqlx::query_as(
-        "SELECT id, name, version, vendor, creation_date, tags, tenant_id
-         FROM integration_packages
-         ORDER BY name ASC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+async fn fetch_recent_logs(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<LogRow>> {
+    fetch_logs(pool, tenant, search, limit).await
 }
 
-/// Erreurs de déploiement (artifact_errors).
-async fn fetch_deploy_errors(pool: &sqlx::PgPool) -> Result<Vec<ErrorView>> {
-    let rows = sqlx::query_as(
-        "SELECT artifact_id, error_message, error_time, tenant_id
-         FROM artifact_errors
-         ORDER BY error_time DESC",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+async fn fetch_logs(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<LogRow>> {
+    if !table_exists(pool, "sap_monitoring_logs").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "sap_monitoring_logs", "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    if has_tenant {
+        Ok(sqlx::query_as::<_, LogRow>(
+            "SELECT tenant_id, parsed_date, status, integration_flow_name, message_guid, error_message
+             FROM sap_monitoring_logs
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+               AND ($2::text IS NULL
+                    OR tenant_id ILIKE $2
+                    OR status ILIKE $2
+                    OR integration_flow_name ILIKE $2
+                    OR message_guid ILIKE $2
+                    OR error_message ILIKE $2)
+             ORDER BY parsed_date DESC NULLS LAST
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    } else {
+        Ok(sqlx::query_as::<_, LogRow>(
+            "SELECT 'cerealog'::text AS tenant_id, parsed_date, status, integration_flow_name, message_guid, error_message
+             FROM sap_monitoring_logs
+             WHERE ($1::text IS NULL
+                    OR status ILIKE $1
+                    OR integration_flow_name ILIKE $1
+                    OR message_guid ILIKE $1
+                    OR error_message ILIKE $1)
+             ORDER BY parsed_date DESC NULLS LAST
+             LIMIT $2",
+        )
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    }
 }
 
-async fn fetch_stats(pool: &sqlx::PgPool) -> Result<Stats> {
-    let row: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT
-            (SELECT COUNT(*) FROM sap_monitoring_logs),
-            (SELECT COUNT(*) FROM sap_monitoring_logs WHERE status = 'FAILED'),
-            (SELECT COUNT(*) FROM integration_packages),
-            (SELECT COUNT(*) FROM runtime_artifacts)",
+async fn fetch_packages(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<PackageRow>> {
+    if !table_exists(pool, "integration_packages").await? {
+        return Ok(Vec::new());
+    }
+
+    let packages_have_tenant = column_exists(pool, "integration_packages", "tenant_id").await?;
+    let artifacts_have_tenant = column_exists(pool, "runtime_artifacts", "tenant_id").await?;
+    let artifacts_exist = table_exists(pool, "runtime_artifacts").await?;
+
+    if !packages_have_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    match (packages_have_tenant, artifacts_exist, artifacts_have_tenant) {
+        (true, true, true) => {
+            Ok(sqlx::query_as::<_, PackageRow>(
+                "SELECT p.tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags,
+                        COUNT(a.id) AS artifact_count
+                 FROM integration_packages p
+                 LEFT JOIN runtime_artifacts a
+                   ON a.tenant_id = p.tenant_id AND a.package_id = p.id
+                 WHERE ($1::text IS NULL OR p.tenant_id = $1)
+                   AND ($2::text IS NULL
+                        OR p.tenant_id ILIKE $2
+                        OR p.id ILIKE $2
+                        OR p.name ILIKE $2
+                        OR p.version ILIKE $2
+                        OR p.vendor ILIKE $2
+                        OR p.tags ILIKE $2)
+                 GROUP BY p.tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags
+                 ORDER BY p.name ASC NULLS LAST, p.id ASC
+                 LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (true, true, false) => {
+            Ok(sqlx::query_as::<_, PackageRow>(
+                "SELECT p.tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags,
+                        COUNT(a.id) AS artifact_count
+                 FROM integration_packages p
+                 LEFT JOIN runtime_artifacts a ON a.package_id = p.id
+                 WHERE ($1::text IS NULL OR p.tenant_id = $1)
+                   AND ($2::text IS NULL
+                        OR p.tenant_id ILIKE $2
+                        OR p.id ILIKE $2
+                        OR p.name ILIKE $2
+                        OR p.version ILIKE $2
+                        OR p.vendor ILIKE $2
+                        OR p.tags ILIKE $2)
+                 GROUP BY p.tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags
+                 ORDER BY p.name ASC NULLS LAST, p.id ASC
+                 LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (false, true, _) => {
+            Ok(sqlx::query_as::<_, PackageRow>(
+                "SELECT 'cerealog'::text AS tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags,
+                        COUNT(a.id) AS artifact_count
+                 FROM integration_packages p
+                 LEFT JOIN runtime_artifacts a ON a.package_id = p.id
+                 WHERE ($1::text IS NULL
+                        OR p.id ILIKE $1
+                        OR p.name ILIKE $1
+                        OR p.version ILIKE $1
+                        OR p.vendor ILIKE $1
+                        OR p.tags ILIKE $1)
+                 GROUP BY p.id, p.name, p.version, p.vendor, p.creation_date, p.tags
+                 ORDER BY p.name ASC NULLS LAST, p.id ASC
+                 LIMIT $2",
+            )
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (true, false, _) => {
+            Ok(sqlx::query_as::<_, PackageRow>(
+                "SELECT p.tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags,
+                        0::bigint AS artifact_count
+                 FROM integration_packages p
+                 WHERE ($1::text IS NULL OR p.tenant_id = $1)
+                   AND ($2::text IS NULL
+                        OR p.tenant_id ILIKE $2
+                        OR p.id ILIKE $2
+                        OR p.name ILIKE $2
+                        OR p.version ILIKE $2
+                        OR p.vendor ILIKE $2
+                        OR p.tags ILIKE $2)
+                 ORDER BY p.name ASC NULLS LAST, p.id ASC
+                 LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (false, false, _) => {
+            Ok(sqlx::query_as::<_, PackageRow>(
+                "SELECT 'cerealog'::text AS tenant_id, p.id, p.name, p.version, p.vendor, p.creation_date, p.tags,
+                        0::bigint AS artifact_count
+                 FROM integration_packages p
+                 WHERE ($1::text IS NULL
+                        OR p.id ILIKE $1
+                        OR p.name ILIKE $1
+                        OR p.version ILIKE $1
+                        OR p.vendor ILIKE $1
+                        OR p.tags ILIKE $1)
+                 ORDER BY p.name ASC NULLS LAST, p.id ASC
+                 LIMIT $2",
+            )
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+    }
+}
+
+async fn fetch_artifacts(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ArtifactRow>> {
+    if !table_exists(pool, "runtime_artifacts").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "runtime_artifacts", "tenant_id").await?;
+    let has_type = column_exists(pool, "runtime_artifacts", "artifact_type").await?;
+
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    match (has_tenant, has_type) {
+        (true, true) => {
+            Ok(sqlx::query_as::<_, ArtifactRow>(
+                "SELECT tenant_id, id, name, status, package_id, deployed_on, artifact_type
+                 FROM runtime_artifacts
+                 WHERE ($1::text IS NULL OR tenant_id = $1)
+                   AND ($2::text IS NULL
+                        OR tenant_id ILIKE $2
+                        OR id ILIKE $2
+                        OR name ILIKE $2
+                        OR status ILIKE $2
+                        OR package_id ILIKE $2
+                        OR artifact_type ILIKE $2)
+                 ORDER BY deployed_on DESC NULLS LAST, name ASC NULLS LAST
+                 LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (true, false) => {
+            Ok(sqlx::query_as::<_, ArtifactRow>(
+                "SELECT tenant_id, id, name, status, package_id, deployed_on, NULL::text AS artifact_type
+                 FROM runtime_artifacts
+                 WHERE ($1::text IS NULL OR tenant_id = $1)
+                   AND ($2::text IS NULL
+                        OR tenant_id ILIKE $2
+                        OR id ILIKE $2
+                        OR name ILIKE $2
+                        OR status ILIKE $2
+                        OR package_id ILIKE $2)
+                 ORDER BY deployed_on DESC NULLS LAST, name ASC NULLS LAST
+                 LIMIT $3",
+            )
+            .bind(tenant)
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (false, true) => {
+            Ok(sqlx::query_as::<_, ArtifactRow>(
+                "SELECT 'cerealog'::text AS tenant_id, id, name, status, package_id, deployed_on, artifact_type
+                 FROM runtime_artifacts
+                 WHERE ($1::text IS NULL
+                        OR id ILIKE $1
+                        OR name ILIKE $1
+                        OR status ILIKE $1
+                        OR package_id ILIKE $1
+                        OR artifact_type ILIKE $1)
+                 ORDER BY deployed_on DESC NULLS LAST, name ASC NULLS LAST
+                 LIMIT $2",
+            )
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+        (false, false) => {
+            Ok(sqlx::query_as::<_, ArtifactRow>(
+                "SELECT 'cerealog'::text AS tenant_id, id, name, status, package_id, deployed_on, NULL::text AS artifact_type
+                 FROM runtime_artifacts
+                 WHERE ($1::text IS NULL
+                        OR id ILIKE $1
+                        OR name ILIKE $1
+                        OR status ILIKE $1
+                        OR package_id ILIKE $1)
+                 ORDER BY deployed_on DESC NULLS LAST, name ASC NULLS LAST
+                 LIMIT $2",
+            )
+            .bind(search)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?)
+        }
+    }
+}
+
+async fn fetch_errors(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ErrorRow>> {
+    if !table_exists(pool, "artifact_errors").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "artifact_errors", "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    if has_tenant {
+        Ok(sqlx::query_as::<_, ErrorRow>(
+            "SELECT tenant_id, artifact_id, error_time, error_message
+             FROM artifact_errors
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+               AND ($2::text IS NULL
+                    OR tenant_id ILIKE $2
+                    OR artifact_id ILIKE $2
+                    OR error_message ILIKE $2)
+             ORDER BY error_time DESC NULLS LAST
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    } else {
+        Ok(sqlx::query_as::<_, ErrorRow>(
+            "SELECT 'cerealog'::text AS tenant_id, artifact_id, error_time, error_message
+             FROM artifact_errors
+             WHERE ($1::text IS NULL
+                    OR artifact_id ILIKE $1
+                    OR error_message ILIKE $1)
+             ORDER BY error_time DESC NULLS LAST
+             LIMIT $2",
+        )
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    }
+}
+
+async fn fetch_configurations(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ConfigurationRow>> {
+    if !table_exists(pool, "artifact_configurations").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "artifact_configurations", "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    if has_tenant {
+        Ok(sqlx::query_as::<_, ConfigurationRow>(
+            "SELECT tenant_id, artifact_id, parameter_key, parameter_value, data_type
+             FROM artifact_configurations
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+               AND ($2::text IS NULL
+                    OR tenant_id ILIKE $2
+                    OR artifact_id ILIKE $2
+                    OR parameter_key ILIKE $2
+                    OR parameter_value ILIKE $2
+                    OR data_type ILIKE $2)
+             ORDER BY artifact_id ASC, parameter_key ASC
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    } else {
+        Ok(sqlx::query_as::<_, ConfigurationRow>(
+            "SELECT 'cerealog'::text AS tenant_id, artifact_id, parameter_key, parameter_value, data_type
+             FROM artifact_configurations
+             WHERE ($1::text IS NULL
+                    OR artifact_id ILIKE $1
+                    OR parameter_key ILIKE $1
+                    OR parameter_value ILIKE $1
+                    OR data_type ILIKE $1)
+             ORDER BY artifact_id ASC, parameter_key ASC
+             LIMIT $2",
+        )
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    }
+}
+
+async fn fetch_pending_alerts(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<PendingAlertRow>> {
+    if !table_exists(pool, "pending_alerts").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "pending_alerts", "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    if has_tenant {
+        Ok(sqlx::query_as::<_, PendingAlertRow>(
+            "SELECT tenant_id, log_guid, flow_name, error_type, error_snippet, detected_at
+             FROM pending_alerts
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+               AND ($2::text IS NULL
+                    OR tenant_id ILIKE $2
+                    OR log_guid ILIKE $2
+                    OR flow_name ILIKE $2
+                    OR error_type ILIKE $2
+                    OR error_snippet ILIKE $2)
+             ORDER BY detected_at DESC NULLS LAST
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    } else {
+        Ok(sqlx::query_as::<_, PendingAlertRow>(
+            "SELECT 'cerealog'::text AS tenant_id, log_guid, flow_name, error_type, error_snippet, detected_at
+             FROM pending_alerts
+             WHERE ($1::text IS NULL
+                    OR log_guid ILIKE $1
+                    OR flow_name ILIKE $1
+                    OR error_type ILIKE $1
+                    OR error_snippet ILIKE $1)
+             ORDER BY detected_at DESC NULLS LAST
+             LIMIT $2",
+        )
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    }
+}
+
+async fn fetch_smart_alerts(
+    pool: &PgPool,
+    tenant: Option<&str>,
+    search: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SmartAlertRow>> {
+    if !table_exists(pool, "smart_alerts").await? {
+        return Ok(Vec::new());
+    }
+
+    let has_tenant = column_exists(pool, "smart_alerts", "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(Vec::new());
+    }
+
+    if has_tenant {
+        Ok(sqlx::query_as::<_, SmartAlertRow>(
+            "SELECT tenant_id, flow_name, alert_type, status, last_triggered_at, extra::text AS extra
+             FROM smart_alerts
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+               AND ($2::text IS NULL
+                    OR tenant_id ILIKE $2
+                    OR flow_name ILIKE $2
+                    OR alert_type ILIKE $2
+                    OR status ILIKE $2
+                    OR extra::text ILIKE $2)
+             ORDER BY last_triggered_at DESC NULLS LAST
+             LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    } else {
+        Ok(sqlx::query_as::<_, SmartAlertRow>(
+            "SELECT 'cerealog'::text AS tenant_id, flow_name, alert_type, status, last_triggered_at, extra::text AS extra
+             FROM smart_alerts
+             WHERE ($1::text IS NULL
+                    OR flow_name ILIKE $1
+                    OR alert_type ILIKE $1
+                    OR status ILIKE $1
+                    OR extra::text ILIKE $1)
+             ORDER BY last_triggered_at DESC NULLS LAST
+             LIMIT $2",
+        )
+        .bind(search)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?)
+    }
+}
+
+async fn count_active_tenants(pool: &PgPool, tenant: Option<&str>) -> Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM tenants
+         WHERE active = true AND ($1::text IS NULL OR id = $1)",
     )
+    .bind(tenant)
     .fetch_one(pool)
-    .await?;
-
-    Ok(Stats {
-        total_logs: row.0,
-        failed_logs: row.1,
-        total_packages: row.2,
-        total_artifacts: row.3,
-    })
+    .await?)
 }
 
-async fn fetch_hourly_errors(pool: &sqlx::PgPool) -> Result<Vec<u64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM sap_monitoring_logs
-         WHERE status = 'FAILED'
-           AND parsed_date > NOW() - INTERVAL '24 hours'
-         GROUP BY date_trunc('hour', parsed_date)
-         ORDER BY date_trunc('hour', parsed_date)",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.iter().map(|(c,)| *c as u64).collect())
-}
-
-async fn fetch_daily_errors(pool: &sqlx::PgPool) -> Result<Vec<(String, u64)>> {
-    let rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
-        "SELECT parsed_date::date, COUNT(*)
-         FROM sap_monitoring_logs
-         WHERE status = 'FAILED' AND parsed_date > NOW() - INTERVAL '7 days'
-         GROUP BY parsed_date::date ORDER BY 1",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .iter()
-        .map(|(d, c)| (d.format("%a").to_string(), *c as u64))
-        .collect())
-}
-
-async fn fetch_activity(pool: &sqlx::PgPool) -> Result<Vec<u64>> {
-    let rows: Vec<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM sap_monitoring_logs
-         WHERE parsed_date > NOW() - INTERVAL '12 hours'
-         GROUP BY date_trunc('hour', parsed_date)
-         ORDER BY date_trunc('hour', parsed_date)",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.iter().map(|(c,)| *c as u64).collect())
-}
-
-async fn fetch_top_errors(pool: &sqlx::PgPool) -> Result<Vec<(String, u64)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT artifact_id, COUNT(*) as cnt
-         FROM artifact_errors
-         GROUP BY artifact_id
-         ORDER BY cnt DESC
-         LIMIT 5",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(id, c)| (id, c as u64)).collect())
-}
-
-async fn fetch_log_statuses(pool: &sqlx::PgPool) -> Result<Vec<(String, i64)>> {
-    let rows = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM sap_monitoring_logs \
-         WHERE status IS NOT NULL GROUP BY status",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-async fn fetch_artifact_statuses(pool: &sqlx::PgPool) -> Result<Vec<(String, i64)>> {
-    let rows = sqlx::query_as(
-        "SELECT status, COUNT(*) FROM runtime_artifacts \
-         WHERE status IS NOT NULL GROUP BY status",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-async fn fetch_all_configs(pool: &sqlx::PgPool) -> Result<HashMap<String, Vec<(String, String)>>> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT artifact_id, parameter_key, parameter_value FROM artifact_configurations",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (id, key, val) in rows {
-        map.entry(id)
-            .or_default()
-            .push((key, val.unwrap_or_else(|| "—".to_string())));
+async fn count_rows(
+    pool: &PgPool,
+    table_name: &str,
+    tenant: Option<&str>,
+    status: Option<&str>,
+) -> Result<i64> {
+    if !table_exists(pool, table_name).await? {
+        return Ok(0);
     }
-    Ok(map)
-}
 
-pub async fn fetch_active_exec_errors(pool: &sqlx::PgPool) -> Result<Vec<LogView>> {
-    let rows = sqlx::query_as(
-        "SELECT status, parsed_date, error_message, message_guid, integration_flow_name, tenant_id
-         FROM sap_monitoring_logs l
-         WHERE status = 'FAILED'
-           AND integration_flow_name IS NOT NULL
-           AND parsed_date = (
-               SELECT MAX(l2.parsed_date)
-               FROM sap_monitoring_logs l2
-               WHERE l2.integration_flow_name = l.integration_flow_name
-                 AND l2.tenant_id = l.tenant_id
-           )
-         ORDER BY parsed_date DESC NULLS LAST
-         LIMIT 200",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-// ─── Détection d'alertes intelligentes ────────────────────────────────────────
-
-/// Détecte les pics (spikes) d'erreurs pour chaque flux et locataire. Un pic est
-/// caractérisé par un nombre d'échecs dans les 10 dernières minutes au moins
-/// deux fois supérieur à la moyenne des 10 minutes sur l'heure précédente.
-/// Retourne un vecteur de `(tenant_id, flow_name, recent_count, avg_count)`.
-pub async fn detect_spike(pool: &sqlx::PgPool) -> Result<Vec<(String, String, i64, f64)>> {
-    let rows = sqlx::query(
-        "SELECT c.tenant_id, c.integration_flow_name, c.recent_count, c.avg_count
-         FROM (
-            SELECT r.tenant_id,
-                   r.integration_flow_name,
-                   COUNT(*) AS recent_count,
-                   COALESCE((
-                     SELECT COUNT(*)
-                     FROM sap_monitoring_logs s2
-                     WHERE s2.tenant_id = r.tenant_id
-                       AND s2.integration_flow_name = r.integration_flow_name
-                       AND s2.status = 'FAILED'
-                       AND s2.parsed_date <= NOW() - INTERVAL '10 minutes'
-                       AND s2.parsed_date > NOW() - INTERVAL '70 minutes'
-                   ),0) / 6.0 AS avg_count
-            FROM sap_monitoring_logs r
-            WHERE r.status = 'FAILED'
-              AND r.parsed_date > NOW() - INTERVAL '10 minutes'
-            GROUP BY r.tenant_id, r.integration_flow_name
-         ) c
-         WHERE c.recent_count >= 5
-           AND c.recent_count > c.avg_count * 2
-           AND NOT EXISTS (
-               SELECT 1
-               FROM smart_alerts sa
-               WHERE sa.tenant_id = c.tenant_id
-                 AND sa.flow_name = c.integration_flow_name
-                 AND sa.alert_type = 'SPIKE'
-                 AND sa.last_triggered_at > NOW() - INTERVAL '30 minutes'
-           )",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        let tenant_id: String = row.try_get(0)?;
-        let flow_name: String = row.try_get(1)?;
-        let recent_count: i64 = row.try_get(2)?;
-        let avg_count: f64 = row.try_get(3)?;
-        results.push((tenant_id, flow_name, recent_count, avg_count));
+    let has_tenant = column_exists(pool, table_name, "tenant_id").await?;
+    if !has_tenant && !legacy_tenant_matches(tenant) {
+        return Ok(0);
     }
-    Ok(results)
-}
 
-/// Détecte les régressions d'un flux : lorsque la dernière exécution est en
-/// échec (`FAILED`) et que l'exécution précédente n'était pas en échec. Les
-/// régressions déjà traitées au cours des 30 dernières minutes sont ignorées.
-pub async fn detect_regression(pool: &sqlx::PgPool) -> Result<Vec<(String, String)>> {
-    let rows = sqlx::query(
-        "WITH ranked AS (
-            SELECT tenant_id, integration_flow_name, status,
-                   ROW_NUMBER() OVER (PARTITION BY tenant_id, integration_flow_name ORDER BY parsed_date DESC) AS rn
-            FROM sap_monitoring_logs
-        ), last_two AS (
-            SELECT tenant_id, integration_flow_name,
-                   MAX(CASE WHEN rn = 1 THEN status END) AS last_status,
-                   MAX(CASE WHEN rn = 2 THEN status END) AS prev_status
-            FROM ranked
-            WHERE rn <= 2
-            GROUP BY tenant_id, integration_flow_name
+    match (table_name, has_tenant, status) {
+        ("sap_monitoring_logs", true, Some(status)) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sap_monitoring_logs WHERE status = $1 AND ($2::text IS NULL OR tenant_id = $2)",
         )
-        SELECT tenant_id, integration_flow_name
-        FROM last_two
-        WHERE last_status = 'FAILED'
-          AND (prev_status IS NULL OR prev_status != 'FAILED')
-          AND NOT EXISTS (
-              SELECT 1
-              FROM smart_alerts sa
-              WHERE sa.tenant_id = last_two.tenant_id
-                AND sa.flow_name = last_two.integration_flow_name
-                AND sa.alert_type = 'REGRESSION'
-                AND sa.last_triggered_at > NOW() - INTERVAL '30 minutes'
-          )",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        let tenant_id: String = row.try_get(0)?;
-        let flow_name: String = row.try_get(1)?;
-        results.push((tenant_id, flow_name));
+        .bind(status)
+        .bind(tenant)
+        .fetch_one(pool)
+        .await?),
+        ("sap_monitoring_logs", false, Some(status)) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sap_monitoring_logs WHERE status = $1",
+        )
+        .bind(status)
+        .fetch_one(pool)
+        .await?),
+        ("sap_monitoring_logs", true, None) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sap_monitoring_logs WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(pool)
+        .await?),
+        ("sap_monitoring_logs", false, None) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sap_monitoring_logs",
+        )
+        .fetch_one(pool)
+        .await?),
+        ("integration_packages", true, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM integration_packages WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(pool)
+        .await?),
+        ("integration_packages", false, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM integration_packages",
+        )
+        .fetch_one(pool)
+        .await?),
+        ("runtime_artifacts", true, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM runtime_artifacts WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(pool)
+        .await?),
+        ("runtime_artifacts", false, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM runtime_artifacts",
+        )
+        .fetch_one(pool)
+        .await?),
+        ("pending_alerts", true, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_alerts WHERE ($1::text IS NULL OR tenant_id = $1)",
+        )
+        .bind(tenant)
+        .fetch_one(pool)
+        .await?),
+        ("pending_alerts", false, _) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_alerts",
+        )
+        .fetch_one(pool)
+        .await?),
+        _ => Ok(0),
     }
-    Ok(results)
 }
 
-/// Détecte les pannes persistantes d'un flux : lorsqu'aucune exécution
-/// réussie (statut différent de `FAILED`) n'a eu lieu depuis plus de 30
-/// minutes et que la dernière exécution est un échec. Retourne un vecteur
-/// `(tenant_id, flow_name, durée_en_minutes)` pour chaque flux en panne. Les
-/// pannes déjà signalées dans les 30 dernières minutes sont ignorées.
-pub async fn detect_persistent_failure(pool: &sqlx::PgPool) -> Result<Vec<(String, String, i64)>> {
-    let rows = sqlx::query(
-        "WITH last_dates AS (
-            SELECT tenant_id, integration_flow_name,
-                   MAX(CASE WHEN status = 'FAILED' THEN parsed_date END) AS last_failed,
-                   MAX(CASE WHEN status != 'FAILED' THEN parsed_date END) AS last_success
-            FROM sap_monitoring_logs
-            GROUP BY tenant_id, integration_flow_name
-        )
-        SELECT tenant_id, integration_flow_name,
-               EXTRACT(EPOCH FROM (NOW() - COALESCE(last_success, NOW()))) / 60 AS fail_duration
-        FROM last_dates
-        WHERE (last_success IS NULL OR last_success < NOW() - INTERVAL '30 minutes')
-          AND last_failed >= COALESCE(last_success, last_failed)
-          AND NOT EXISTS (
-              SELECT 1 FROM smart_alerts sa
-              WHERE sa.tenant_id = last_dates.tenant_id
-                AND sa.flow_name = last_dates.integration_flow_name
-                AND sa.alert_type = 'PERSISTENT'
-                AND sa.last_triggered_at > NOW() - INTERVAL '30 minutes'
-          )",
-    )
-    .fetch_all(pool)
-    .await?;
+fn legacy_tenant_matches(tenant: Option<&str>) -> bool {
+    tenant
+        .map(|tenant| tenant == LEGACY_TENANT_ID)
+        .unwrap_or(true)
+}
 
-    let mut results = Vec::new();
-    for row in rows {
-        let tenant_id: String = row.try_get(0)?;
-        let flow_name: String = row.try_get(1)?;
-        let duration: f64 = row.try_get(2)?;
-        // round the duration to the nearest integer minute
-        let mins = duration.round() as i64;
-        results.push((tenant_id, flow_name, mins));
-    }
-    Ok(results)
+fn normalize_search(search: Option<&str>) -> Option<String> {
+    search
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{}%", s))
+}
+
+async fn table_exists(pool: &PgPool, table_name: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_name = $1
+         )",
+    )
+    .bind(table_name)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn column_exists(pool: &PgPool, table_name: &str, column_name: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = $1
+               AND column_name = $2
+         )",
+    )
+    .bind(table_name)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await?)
 }

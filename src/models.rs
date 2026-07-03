@@ -1,211 +1,120 @@
 use chrono::NaiveDateTime;
 use serde::Deserialize;
+use sqlx::FromRow;
 
-#[derive(Deserialize, Debug)]
-pub struct TokenResponse {
-    pub access_token: String,
+#[derive(Debug, Clone, FromRow)]
+pub struct Tenant {
+    pub id: String,
+    pub name: String,
+    pub client_name: Option<String>,
+    pub shared_tenant: Option<bool>,
+    pub active: Option<bool>,
+    pub created_at: Option<NaiveDateTime>,
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
-pub struct LogEntry {
-    pub message_guid: Option<String>,
-    pub status: Option<String>,
-    pub log_start: Option<String>,
-    pub integration_flow_name: Option<String>,
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct OverviewStats {
+    pub active_tenants: i64,
+    pub total_logs: i64,
+    pub failed_logs: i64,
+    pub completed_logs: i64,
+    pub total_packages: i64,
+    pub total_artifacts: i64,
+    pub pending_alerts: i64,
+}
 
-    #[serde(skip)]
+#[derive(Debug, Clone, FromRow)]
+pub struct LogRow {
+    pub tenant_id: String,
     pub parsed_date: Option<NaiveDateTime>,
-
-    #[serde(skip)]
+    pub status: Option<String>,
+    pub integration_flow_name: Option<String>,
+    pub message_guid: String,
     pub error_message: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ODataResponse {
-    pub d: ODataData,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataData {
-    pub results: Vec<LogEntry>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "PascalCase")]
-pub struct IntegrationPackage {
-    #[serde(alias = "Id", alias = "id")]
-    pub id: Option<String>,
+#[derive(Debug, Clone, FromRow)]
+pub struct PackageRow {
+    pub tenant_id: String,
+    pub id: String,
     pub name: Option<String>,
     pub version: Option<String>,
     pub vendor: Option<String>,
-    #[serde(alias = "CreationDate", alias = "creationDate", alias = "Creationdate")]
-    pub creation_date: Option<String>,
-
-    pub industries: Option<String>,
-    pub keywords: Option<String>,
-    pub products: Option<String>,
-    pub countries: Option<String>,
-    #[serde(alias = "LineOfBusiness", alias = "lineOfBusiness")]
-    pub line_of_business: Option<String>,
-
-    #[serde(skip)]
-    pub parsed_creation_date: Option<NaiveDateTime>,
+    pub creation_date: Option<NaiveDateTime>,
+    pub tags: Option<String>,
+    pub artifact_count: i64,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ODataPackageResponse {
-    pub d: ODataPackageData,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataPackageData {
-    pub results: Vec<IntegrationPackage>,
-}
-
-#[derive(Deserialize, Debug, Clone, sqlx::FromRow)]
-#[serde(rename_all = "PascalCase")]
-pub struct RuntimeArtifact {
-    #[serde(alias = "Id", alias = "id")]
-    pub id: Option<String>,
-
-    #[serde(
-        alias = "PackageId",
-        alias = "packageId",
-        alias = "Packageid",
-        alias = "packageid"
-    )]
-    pub package_id: Option<String>,
-
+#[derive(Debug, Clone, FromRow)]
+pub struct ArtifactRow {
+    pub tenant_id: String,
+    pub id: String,
     pub name: Option<String>,
-    pub version: Option<String>,
-
-    #[serde(rename = "Type")]
-    pub artifact_type: Option<String>,
-
     pub status: Option<String>,
-    #[serde(alias = "DeployedOn", alias = "deployedOn", alias = "Deployedon")]
-    pub deployed_on: Option<String>,
-
-    #[serde(skip)]
-    pub parsed_deployed_on: Option<NaiveDateTime>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataArtifactResponse {
-    pub d: ODataArtifactData,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataArtifactData {
-    pub results: Vec<RuntimeArtifact>,
-}
-
-#[derive(Debug)]
-pub struct ArtifactError {
-    pub artifact_id: String,
-    pub error_message: String,
-    pub error_time: chrono::NaiveDateTime,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataDesignResponse {
-    pub d: ODataDesignData,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ODataDesignData {
-    pub results: Vec<DesigntimeArtifact>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
-pub struct DesigntimeArtifact {
-    #[serde(alias = "Id", alias = "id")]
-    pub id: Option<String>,
-
-    #[serde(alias = "PackageId", alias = "packageId")]
     pub package_id: Option<String>,
+    pub deployed_on: Option<NaiveDateTime>,
+    pub artifact_type: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
-pub struct ArtifactConfiguration {
-    pub parameter_key: Option<String>,
+#[derive(Debug, Clone, FromRow)]
+pub struct ErrorRow {
+    pub tenant_id: String,
+    pub artifact_id: String,
+    pub error_time: Option<NaiveDateTime>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ConfigurationRow {
+    pub tenant_id: String,
+    pub artifact_id: String,
+    pub parameter_key: String,
     pub parameter_value: Option<String>,
     pub data_type: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ODataConfigResponse {
-    pub d: ODataConfigData,
+#[derive(Debug, Clone, FromRow)]
+pub struct PendingAlertRow {
+    pub tenant_id: String,
+    pub log_guid: String,
+    pub flow_name: Option<String>,
+    pub error_type: Option<String>,
+    pub error_snippet: Option<String>,
+    pub detected_at: Option<NaiveDateTime>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ODataConfigData {
-    pub results: Vec<ArtifactConfiguration>,
+#[derive(Debug, Clone, FromRow)]
+pub struct SmartAlertRow {
+    pub tenant_id: String,
+    pub flow_name: String,
+    pub alert_type: String,
+    pub status: String,
+    pub last_triggered_at: Option<NaiveDateTime>,
+    pub extra: Option<String>,
 }
 
-// ─── Statistiques globales ───────────────────────────────────────────────────
-
-#[derive(Default)]
-pub struct Stats {
-    pub total_logs: i64,
-    pub failed_logs: i64,
-    pub total_packages: i64,
-    pub total_artifacts: i64,
+#[derive(Debug, Clone, Default)]
+pub struct AlertData {
+    pub pending: Vec<PendingAlertRow>,
+    pub smart: Vec<SmartAlertRow>,
 }
 
-// impl Default for Stats {
-//     fn default() -> Self {
-//         Self {
-//             total_logs: 0,
-//             failed_logs: 0,
-//             total_packages: 0,
-//             total_artifacts: 0,
-//         }
-//     }
-// }
-
-// ─── Payload envoyé via le channel async worker → UI ────────────────────────
-
-use crate::db::{ArtifactView, ErrorView, LogView, PackageView};
-use std::collections::HashMap;
-
-pub struct RefreshData {
-    pub logs: Vec<LogView>,
-    pub exec_errors: Vec<LogView>,
-    pub active_exec_errors: Vec<LogView>,
-    pub artifacts: Vec<ArtifactView>,
-    pub packages: Vec<PackageView>,
-    pub deploy_errors: Vec<ErrorView>,
-    pub configs: HashMap<String, Vec<(String, String)>>,
-    pub stats: Stats,
-    pub error_sparkline: Vec<u64>,
-    pub error_barchart: Vec<(String, u64)>,
-    pub activity_sparkline: Vec<u64>,
-    pub top_errors_barchart: Vec<(String, u64)>,
-    pub status_counts: Vec<(String, u64)>,
+#[derive(Debug, Clone, Default)]
+pub struct DataSet {
+    pub tenants: Vec<Tenant>,
+    pub stats: OverviewStats,
+    pub recent_logs: Vec<LogRow>,
+    pub logs: Vec<LogRow>,
+    pub packages: Vec<PackageRow>,
+    pub artifacts: Vec<ArtifactRow>,
+    pub errors: Vec<ErrorRow>,
+    pub configurations: Vec<ConfigurationRow>,
+    pub alerts: AlertData,
 }
 
-// ─── Types d'alertes intelligentes ─────────────────────────────────────────
-
-/// Represents high‑level intelligent alert types. These enums carry
-/// additional contextual data when needed (e.g. number of recent errors or
-/// duration of a persistent failure). When converting from the JSON stored
-/// in `smart_alerts.extra`, you can match on the variant to build a
-/// descriptive Teams message. Note that the names must correspond to the
-/// values stored in the database (`SPIKE`, `REGRESSION`, `PERSISTENT`).
-#[derive(Debug, Clone)]
-pub enum AlertType {
-    /// An abrupt increase in the number of errors over the recent time
-    /// window compared to the historical baseline. Contains the number of
-    /// recent failed executions and the average per window.
-    Spike { recent_count: u64, avg_count: f64 },
-    /// A flow whose last execution status is `FAILED` whereas the previous
-    /// status was not `FAILED`, indicating a regression.
-    Regression,
-    /// A flow that remains in a failed state for an extended period. Stores
-    /// the duration in minutes since the last successful execution.
-    PersistentFailure { duration_mins: u64 },
+#[derive(Debug, Clone, Deserialize)]
+pub struct CliConfig {
+    pub tenant: Option<String>,
+    pub limit: i64,
+    pub refresh_seconds: u64,
 }

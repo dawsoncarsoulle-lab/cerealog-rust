@@ -1,422 +1,237 @@
-pub mod app;
-pub mod footer;
-pub mod overlay;
-pub mod tabs;
-pub mod theme;
+pub mod alerts;
+pub mod artifacts;
+pub mod configurations;
+pub mod errors;
+pub mod logs;
+pub mod overview;
+pub mod packages;
+pub mod tenants;
 
-pub use app::{App, OverlayState};
-
-use crate::models::RefreshData;
-use crate::ui::app::{CalendarState, PackageFocus};
-use crate::ui::footer::{draw_footer, draw_header};
-use crate::ui::overlay::{draw_overlay, draw_overlay_calendar, draw_overlay_tenant};
-use crate::ui::tabs::{
-    analytics::{draw_analytics, draw_stats_and_charts},
-    artifacts::draw_artifacts_table,
-    errors::{draw_deploy_errors_table, draw_exec_errors_table},
-    logs::draw_logs_master_detail,
-    packages::draw_packages_master_detail,
-    Tab,
-};
-use crate::ui::theme::C_BG;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use chrono::NaiveDateTime;
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::Style,
-    widgets::Block,
-    Frame, Terminal,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Tabs},
+    Frame,
 };
-use std::io;
-use std::time::{Duration, Instant};
 
-// ─── Événements retournés à main ─────────────────────────────────────────────
+use crate::app::{App, Tab};
 
-#[derive(Debug, PartialEq)]
-pub enum AppEvent {
-    Quit,
-    TriggerRefresh { full: bool },
-    LoadMore,
-    Continue,
+pub fn render(frame: &mut Frame, app: &App) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(frame.size());
+
+    render_header(frame, app, root[0]);
+    render_tabs(frame, app, root[1]);
+
+    match app.active_tab {
+        Tab::Overview => overview::render(frame, app, root[2]),
+        Tab::Logs => logs::render(frame, app, root[2]),
+        Tab::Packages => packages::render(frame, app, root[2]),
+        Tab::Artifacts => artifacts::render(frame, app, root[2]),
+        Tab::Errors => errors::render(frame, app, root[2]),
+        Tab::Configurations => configurations::render(frame, app, root[2]),
+        Tab::Alerts => alerts::render(frame, app, root[2]),
+    }
+
+    render_footer(frame, app, root[3]);
 }
 
-// ─── Entrée TUI ───────────────────────────────────────────────────────────────
+fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    let tenant = app.selected_tenant.as_deref().unwrap_or("global");
+    let query = app.active_query();
+    let search = if query.is_empty() {
+        "Search: -".to_string()
+    } else {
+        format!(
+            "Search: \"{}\" | {}/{} resultats",
+            query,
+            app.current_match_count(),
+            app.current_total_count()
+        )
+    };
+    let refreshed = app
+        .last_refresh
+        .map(|instant| format!("{}s", instant.elapsed().as_secs()))
+        .unwrap_or_else(|| "-".to_string());
 
-pub fn run_tui(
-    app: &mut App,
-    rx: &mut tokio::sync::mpsc::Receiver<RefreshData>,
-) -> anyhow::Result<AppEvent> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let tick_rate = Duration::from_millis(120);
-    let result = run_loop(&mut terminal, app, tick_rate, rx);
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    result
+    let line = Line::from(vec![
+        Span::styled(
+            "cerealog-tui",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "  tenant: {tenant}  limit: {}  {search}  refresh: {refreshed}",
+            app.limit
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
 }
 
-fn run_loop<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-    tick_rate: Duration,
-    rx: &mut tokio::sync::mpsc::Receiver<RefreshData>,
-) -> anyhow::Result<AppEvent> {
-    loop {
-        while let Ok(data) = rx.try_recv() {
-            app.apply_refresh_data(data);
-            app.refreshing = false;
+fn render_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let titles = Tab::ALL.iter().map(|tab| Line::from(tab.title()));
+    let selected = Tab::ALL
+        .iter()
+        .position(|tab| *tab == app.active_tab)
+        .unwrap_or(0);
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .divider(" ");
+    frame.render_widget(tabs, area);
+}
+
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let tenant_hint = if app.initial_tenant.is_none() {
+        " t tenant  g global "
+    } else {
+        ""
+    };
+    let search_hint = if app.search_active() || app.editing_search {
+        " Enter: detail  Esc: effacer "
+    } else {
+        " Enter: detail "
+    };
+    let text = format!(
+        " Tab/Shift+Tab onglets  Up/Down navigation  / recherche {search_hint} r reload {} q quitter | {}",
+        tenant_hint, app.status
+    );
+    frame.render_widget(
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+pub fn empty_message(message: &str) -> Paragraph<'_> {
+    Paragraph::new(message.to_string())
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL))
+}
+
+pub fn selected_style() -> Style {
+    Style::default()
+        .bg(Color::Gray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+pub fn matched_row_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn status_style(status: &str) -> Style {
+    match status.to_ascii_uppercase().as_str() {
+        "FAILED" => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        "COMPLETED" => Style::default().fg(Color::LightGreen),
+        _ => Style::default(),
+    }
+}
+
+pub fn highlight_match(text: &str, query: &str) -> Line<'static> {
+    let terms = highlight_terms(query);
+    if text.is_empty() || terms.is_empty() || !text.is_ascii() {
+        return Line::from(text.to_string());
+    }
+
+    let lower = text.to_lowercase();
+    let mut ranges = Vec::new();
+    for term in terms {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(&term) {
+            let from = start + pos;
+            let to = from + term.len();
+            ranges.push((from, to));
+            start = to;
         }
+    }
 
-        terminal.draw(|f| draw(f, app))?;
+    if ranges.is_empty() {
+        return Line::from(text.to_string());
+    }
 
-        let timeout = tick_rate
-            .checked_sub(app.last_tick.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    return Ok(AppEvent::Quit);
-                }
-
-                if let OverlayState::TenantFilter { selected } = app.overlay {
-                    let mut new_selected = selected;
-                    let tenants = app.available_tenants();
-                    let total = tenants.len() + 1;
-
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            app.overlay = OverlayState::Hidden;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            new_selected = new_selected.saturating_sub(1);
-                            app.overlay = OverlayState::TenantFilter {
-                                selected: new_selected,
-                            };
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            new_selected = (new_selected + 1).min(total - 1);
-                            app.overlay = OverlayState::TenantFilter {
-                                selected: new_selected,
-                            };
-                        }
-                        KeyCode::Enter => {
-                            if new_selected == 0 {
-                                app.tenant_filter = None;
-                            } else {
-                                app.tenant_filter = Some(tenants[new_selected - 1].clone());
-                            }
-                            app.overlay = OverlayState::Hidden;
-                            app.apply_filters();
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                // ── Overlay Calendrier
-                if let OverlayState::Calendar(ref mut cal) = app.overlay {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.overlay = OverlayState::Hidden;
-                        }
-                        KeyCode::Left => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                cal.prev_month();
-                            } else {
-                                cal.cursor_left();
-                            }
-                        }
-                        KeyCode::Right => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                cal.next_month();
-                            } else {
-                                cal.cursor_right();
-                            }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => cal.cursor_up(),
-                        KeyCode::Down | KeyCode::Char('j') => cal.cursor_down(),
-                        KeyCode::Char('h') => cal.cursor_left(),
-                        KeyCode::Char('l') => cal.cursor_right(),
-                        KeyCode::Char('c') => {
-                            app.overlay = OverlayState::Hidden;
-                            app.date_filter = None;
-                            app.apply_filters();
-                        }
-                        KeyCode::Enter => {
-                            let done = cal.confirm();
-                            if done {
-                                let start = cal.date_start.unwrap();
-                                let end = cal.date_end.unwrap();
-                                app.date_filter = Some((start, end));
-                                app.overlay = OverlayState::Hidden;
-                                app.apply_filters();
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // ── Overlays génériques
-                match &app.overlay {
-                    OverlayState::Done { .. }
-                    | OverlayState::Error { .. }
-                    | OverlayState::ArtifactDetail { .. }
-                    | OverlayState::LogDetail { .. } => {
-                        if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-                            app.overlay = OverlayState::Hidden;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                // ── Mode recherche
-                if app.search_active {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.search_active = false;
-                            app.search_query.clear();
-                            app.apply_filters();
-                        }
-                        KeyCode::Enter => {
-                            app.search_active = false;
-                        }
-                        KeyCode::Backspace => {
-                            app.search_query.pop();
-                            app.apply_filters();
-                        }
-                        KeyCode::Char(c) => {
-                            app.search_query.push(c);
-                            app.apply_filters();
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                // ── Raccourcis globaux
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        if app.active_tab == Tab::Packages
-                            && app.package_focus != PackageFocus::List
-                        {
-                            app.package_focus = PackageFocus::List;
-                        } else {
-                            return Ok(AppEvent::Quit);
-                        }
-                    }
-                    KeyCode::Char('h') if app.active_tab == Tab::ExecErrors => {
-                        app.exec_errors_history_mode = !app.exec_errors_history_mode;
-                    }
-                    KeyCode::Tab => app.next_tab(),
-                    KeyCode::BackTab => app.prev_tab(),
-                    KeyCode::Right
-                        if app.active_tab != Tab::Packages
-                            || app.package_focus == PackageFocus::List =>
-                    {
-                        app.next_tab();
-                    }
-                    KeyCode::Left
-                        if app.active_tab != Tab::Packages
-                            || app.package_focus == PackageFocus::List =>
-                    {
-                        app.prev_tab();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => app.next_row(),
-                    KeyCode::Up | KeyCode::Char('k') => app.prev_row(),
-                    KeyCode::Char('r') if !app.refreshing => {
-                        app.refreshing = true;
-                        return Ok(AppEvent::TriggerRefresh { full: false });
-                    }
-                    KeyCode::Char('R') if !app.refreshing => {
-                        app.refreshing = true;
-                        return Ok(AppEvent::TriggerRefresh { full: true });
-                    }
-                    KeyCode::Char('+') => {
-                        app.logs_limit += 500;
-                        return Ok(AppEvent::LoadMore);
-                    }
-                    KeyCode::Char('d') => {
-                        app.overlay = OverlayState::Calendar(CalendarState::new());
-                    }
-                    KeyCode::Char('D') => {
-                        app.date_filter = None;
-                        app.apply_filters();
-                    }
-                    KeyCode::Char('t') => {
-                        let selected = app
-                            .available_tenants()
-                            .iter()
-                            .position(|t| Some(t) == app.tenant_filter.as_ref())
-                            .map(|i| i + 1)
-                            .unwrap_or(0);
-                        app.overlay = OverlayState::TenantFilter { selected };
-                    }
-
-                    KeyCode::Enter if app.active_tab == Tab::Packages => match app.package_focus {
-                        PackageFocus::List => {
-                            app.package_focus = PackageFocus::Artifacts;
-                            app.pkg_art_state.select(Some(0));
-                        }
-                        PackageFocus::Artifacts => {
-                            app.package_focus = PackageFocus::Activity;
-                            app.pkg_log_state.select(Some(0));
-                        }
-                        PackageFocus::Activity => {
-                            app.package_focus = PackageFocus::List;
-                        }
-                    },
-
-                    KeyCode::Enter if app.active_tab == Tab::Artifacts => {
-                        if let Some(i) = app.selected() {
-                            if let Some(art) = app.filtered_artifacts.get(i) {
-                                let error = app
-                                    .deploy_errors
-                                    .iter()
-                                    .find(|e| Some(e.artifact_id.as_str()) == art.id.as_deref())
-                                    .and_then(|e| e.error_message.clone());
-                                let art_configs = app
-                                    .configs
-                                    .get(art.id.as_deref().unwrap_or(""))
-                                    .cloned()
-                                    .unwrap_or_default();
-                                app.overlay = OverlayState::ArtifactDetail {
-                                    name: art.name.clone().unwrap_or_default(),
-                                    status: art.status.clone().unwrap_or_default(),
-                                    error,
-                                    configs: art_configs,
-                                };
-                            }
-                        }
-                    }
-
-                    KeyCode::Enter
-                        if app.active_tab == Tab::Logs || app.active_tab == Tab::ExecErrors =>
-                    {
-                        let log_opt = if app.active_tab == Tab::Logs {
-                            app.selected().and_then(|i| app.filtered_logs.get(i))
-                        } else if app.exec_errors_history_mode {
-                            app.selected().and_then(|i| app.filtered_exec_errors.get(i))
-                        } else {
-                            app.selected()
-                                .and_then(|i| app.filtered_active_exec_errors.get(i))
-                        };
-                        if let Some(log) = log_opt {
-                            app.overlay = OverlayState::LogDetail {
-                                guid: log.message_guid.clone().unwrap_or_else(|| "—".to_string()),
-                                status: log.status.clone().unwrap_or_else(|| "—".to_string()),
-                                date: log
-                                    .parsed_date
-                                    .map(|d| d.format("%d/%m/%Y %H:%M:%S").to_string())
-                                    .unwrap_or_else(|| "—".to_string()),
-                                flow: log
-                                    .integration_flow_name
-                                    .clone()
-                                    .unwrap_or_else(|| "—".to_string()),
-                                error: log
-                                    .error_message
-                                    .clone()
-                                    .unwrap_or_else(|| "Aucune information d'erreur.".to_string()),
-                            };
-                        }
-                    }
-
-                    KeyCode::Char(c)
-                        if app.active_tab != Tab::Analytics
-                            && app.package_focus == PackageFocus::List =>
-                    {
-                        app.search_active = true;
-                        app.search_query.push(c);
-                        app.apply_filters();
-                    }
-                    _ => {}
-                }
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
             }
         }
-
-        if app.last_tick.elapsed() >= tick_rate {
-            app.tick();
-            app.last_tick = Instant::now();
-        }
-
-        if app.last_refresh.elapsed().as_secs() >= 295 && !app.refreshing {
-            app.refreshing = true;
-            return Ok(AppEvent::Continue);
-        }
+        merged.push((start, end));
     }
+
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if cursor < start {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+
+    Line::from(spans)
 }
 
-// ─── Rendu principal ──────────────────────────────────────────────────────────
-
-fn draw(f: &mut Frame, app: &mut App) {
-    let size = f.size();
-    f.render_widget(Block::default().style(Style::default().bg(C_BG)), size);
-
-    let is_analytics = app.active_tab == Tab::Analytics;
-
-    let chunks = if is_analytics {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(10),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(size)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(size)
-    };
-
-    draw_header(f, app, chunks[0]);
-
-    if is_analytics {
-        draw_stats_and_charts(f, app, chunks[1]);
-        draw_body(f, app, chunks[2]);
-        draw_footer(f, app, chunks[3]);
-    } else {
-        draw_body(f, app, chunks[1]);
-        draw_footer(f, app, chunks[2]);
-    }
-
-    match &app.overlay {
-        OverlayState::Hidden => {}
-        OverlayState::Calendar(_) => draw_overlay_calendar(f, app, size),
-        OverlayState::TenantFilter { .. } => draw_overlay_tenant(f, app, size),
-        _ => draw_overlay(f, app, size),
-    }
+fn highlight_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter_map(|raw| {
+            let value = raw
+                .split_once(':')
+                .map(|(_, value)| value)
+                .unwrap_or(raw)
+                .trim()
+                .to_lowercase();
+            (!value.is_empty() && value.is_ascii()).then_some(value)
+        })
+        .collect()
 }
 
-fn draw_body(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    match app.active_tab {
-        Tab::Logs => draw_logs_master_detail(f, app, area),
-        Tab::Artifacts => draw_artifacts_table(f, app, area),
-        Tab::Packages => draw_packages_master_detail(f, app, area),
-        Tab::DeployErrors => draw_deploy_errors_table(f, app, area),
-        Tab::ExecErrors => draw_exec_errors_table(f, app, area),
-        Tab::Analytics => draw_analytics(f, app, area),
+pub fn fmt_dt(value: Option<NaiveDateTime>) -> String {
+    value
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+pub fn short(value: Option<&str>, max: usize) -> String {
+    let value = value.unwrap_or("-");
+    if value.chars().count() <= max {
+        return value.to_string();
     }
+    let mut result = value
+        .chars()
+        .take(max.saturating_sub(1))
+        .collect::<String>();
+    result.push_str("...");
+    result
 }
